@@ -163,17 +163,23 @@ class ArloCloudAPI:
         meta = resp.get("meta", {})
         code = meta.get("code", 0)
 
-        if code == 200 and data.get("token"):
-            # Direct success (no 2FA)
+        # Always grab the token if present
+        token = data.get("token", "")
+        authenticated = data.get("authenticated", data.get("authCompleted", False))
+
+        logger.debug(f"Auth response: code={code} authenticated={authenticated} has_token={bool(token)}")
+
+        if code == 200 and token and authenticated:
+            # Fully authenticated (no 2FA needed)
             return self._complete_auth(data)
 
-        # 2FA required (code 200 with authenticated=false, or code 202)
-        if data.get("authenticated") is False or code == 202:
-            self._auth_token_partial = data.get("token", "")
+        if token:
+            # Got a token but auth not complete — 2FA required
+            self._auth_token_partial = token
             self._factor_id = data.get("factorAuthId", "")
 
-            # If no factorAuthId, we need to get factors and start auth
-            if not self._factor_id and self._auth_token_partial:
+            # Need to get factors and start 2FA
+            if not self._factor_id:
                 self._factor_id = self._start_2fa()
 
             if self._factor_id:
