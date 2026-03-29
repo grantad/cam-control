@@ -640,27 +640,34 @@ class ArloCloudAPI:
         speed: float = 0.5,
         duration: float = 0.5,
     ) -> bool:
-        """Move camera by relative amounts."""
+        """
+        Move camera using ONVIF-style continuous move.
+        pan: -1.0 (left) to 1.0 (right)
+        tilt: -1.0 (down) to 1.0 (up)
+        """
         cam = self.cameras.get(camera_id)
         if cam and not cam.has_ptz:
             logger.warning(f"Camera {camera_id} may not support PTZ (model: {cam.model})")
+
+        x = max(-1.0, min(1.0, pan))
+        y = max(-1.0, min(1.0, tilt))
 
         result = self.notify(
             device_id=camera_id,
             action="set",
             resource="cameras/ptz",
             properties={
-                "action": "move",
-                "pan": max(-1.0, min(1.0, pan)),
-                "tilt": max(-1.0, min(1.0, tilt)),
-                "zoom": max(-1.0, min(1.0, zoom)),
-                "speed": max(0.0, min(1.0, speed)),
-                "duration": duration,
+                "action": "continuousMove",
+                "velocity": {
+                    "panTiltSpaces": {
+                        "velocityGenericSpace": {"x": x, "y": y}
+                    },
+                },
             },
         )
 
         if result is not None:
-            logger.info(f"Move: pan={pan:.2f} tilt={tilt:.2f} zoom={zoom:.2f}")
+            logger.info(f"Move: x={x:.2f} y={y:.2f}")
         return result is not None
 
     def move_to(
@@ -671,32 +678,46 @@ class ArloCloudAPI:
         zoom: float = 0.0,
         speed: float = 0.5,
     ) -> bool:
-        """Move camera to absolute position."""
+        """Move camera to absolute position using ONVIF absoluteMove."""
+        x = max(-1.0, min(1.0, pan))
+        y = max(-1.0, min(1.0, tilt))
+
         result = self.notify(
             device_id=camera_id,
             action="set",
-            resource="cameras/ptz/position",
+            resource="cameras/ptz",
             properties={
-                "action": "set",
-                "pan": max(-1.0, min(1.0, pan)),
-                "tilt": max(-1.0, min(1.0, tilt)),
-                "zoom": max(0.0, min(1.0, zoom)),
-                "speed": max(0.0, min(1.0, speed)),
+                "action": "absoluteMove",
+                "position": {
+                    "panTiltSpaces": {
+                        "positionGenericSpace": {"x": x, "y": y}
+                    },
+                },
             },
         )
         return result is not None
 
     def stop_move(self, camera_id: str) -> bool:
+        """Stop any ongoing PTZ movement."""
         result = self.notify(
             camera_id, "set", "cameras/ptz",
-            {"action": "stop"},
+            {"action": "stopMove"},
         )
         return result is not None
 
     def go_home(self, camera_id: str) -> bool:
+        """Return camera to home/center position."""
+        # Use absoluteMove to center position
         result = self.notify(
             camera_id, "set", "cameras/ptz",
-            {"action": "home"},
+            {
+                "action": "absoluteMove",
+                "position": {
+                    "panTiltSpaces": {
+                        "positionGenericSpace": {"x": 0.0, "y": 0.0}
+                    },
+                },
+            },
         )
         return result is not None
 
@@ -765,6 +786,11 @@ class ArloCloudAPI:
         """Start live stream. Returns stream URL if available."""
         camera = self.cameras.get(camera_id)
         parent_id = camera.parent_id if camera else camera_id
+        xcloud_id = camera.xcloud_id if camera else ""
+
+        extra_headers = {}
+        if xcloud_id:
+            extra_headers["xcloudId"] = xcloud_id
 
         resp = self._post(
             f"{ARLO_URLS['base']}/users/devices/startStream",
@@ -773,6 +799,7 @@ class ArloCloudAPI:
                 "from": self.web_id,
                 "resource": f"cameras/{camera_id}",
                 "action": "set",
+                "responseUrl": "",
                 "publishResponse": True,
                 "transId": self._next_trans_id(),
                 "properties": {
@@ -780,11 +807,17 @@ class ArloCloudAPI:
                     "cameraId": camera_id,
                 },
             },
+            extra_headers=extra_headers if extra_headers else None,
         )
 
+        logger.debug(f"startStream response: {json.dumps(resp)[:300] if resp else 'None'}")
+
         if resp and resp.get("data"):
-            url = resp["data"].get("url", "")
+            data = resp["data"]
+            url = data.get("url", "")
             if url:
+                # Use TLS variant
+                url = url.replace("rtsp://", "rtsps://")
                 logger.info(f"Stream URL: {url}")
                 return url
 

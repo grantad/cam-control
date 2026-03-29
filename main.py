@@ -314,8 +314,25 @@ def _run_interactive_cloud(api: ArloCloudAPI, camera_id: str, ccfg: dict,
                            config: Optional[dict] = None, config_path: str = "config.yaml"):
     """Interactive control loop using cloud API."""
     speed = ccfg["move_speed"]
-    step = 0.15
+    step = 0.5   # ONVIF velocity: -1.0 to 1.0
     duration = ccfg["move_duration"]
+    stream_active = False
+
+    def _ensure_stream():
+        """Start stream if not already active — required for PTZ motor control."""
+        nonlocal stream_active, camera_id
+        if stream_active:
+            return True
+        print("  Starting stream (required for PTZ)...")
+        url = api.start_stream(camera_id)
+        if url:
+            print(f"  Stream active: {url[:60]}...")
+            stream_active = True
+        else:
+            print("  Stream start returned no URL (may still work).")
+            stream_active = True  # Try PTZ anyway
+        time.sleep(2)  # Give camera time to wake up
+        return stream_active
 
     print("  === Controls ===")
     print("  Movement:    w/a/s/d or up/down/left/right")
@@ -331,6 +348,8 @@ def _run_interactive_cloud(api: ArloCloudAPI, camera_id: str, ccfg: dict,
     print("  Raw:         raw <action> <resource> <json_properties>")
     print("  Quit:        q")
     print("  " + "-" * 50)
+    print()
+    print("  Note: First PTZ command will auto-start a stream.")
     print()
 
     while True:
@@ -348,28 +367,38 @@ def _run_interactive_cloud(api: ArloCloudAPI, camera_id: str, ccfg: dict,
         if cmd_lower in ("q", "quit", "exit"):
             break
 
-        # Movement
+        # Movement (auto-starts stream on first use)
         elif cmd_lower in ("w", "up"):
+            _ensure_stream()
             api.move(camera_id, tilt=step, speed=speed, duration=duration)
         elif cmd_lower in ("s", "down"):
+            _ensure_stream()
             api.move(camera_id, tilt=-step, speed=speed, duration=duration)
         elif cmd_lower in ("a", "left"):
+            _ensure_stream()
             api.move(camera_id, pan=-step, speed=speed, duration=duration)
         elif cmd_lower in ("d", "right"):
+            _ensure_stream()
             api.move(camera_id, pan=step, speed=speed, duration=duration)
         elif cmd_lower in ("+", "z", "zi", "zoomin"):
+            _ensure_stream()
             api.move(camera_id, zoom=step, speed=speed, duration=duration)
         elif cmd_lower in ("-", "x", "zo", "zoomout"):
+            _ensure_stream()
             api.move(camera_id, zoom=-step, speed=speed, duration=duration)
 
         # Diagonals
         elif cmd_lower in ("wa", "upleft"):
+            _ensure_stream()
             api.move(camera_id, pan=-step, tilt=step, speed=speed, duration=duration)
         elif cmd_lower in ("wd", "upright"):
+            _ensure_stream()
             api.move(camera_id, pan=step, tilt=step, speed=speed, duration=duration)
         elif cmd_lower in ("sa", "downleft"):
+            _ensure_stream()
             api.move(camera_id, pan=-step, tilt=-step, speed=speed, duration=duration)
         elif cmd_lower in ("sd", "downright"):
+            _ensure_stream()
             api.move(camera_id, pan=step, tilt=-step, speed=speed, duration=duration)
 
         # Stop / Home
@@ -377,6 +406,7 @@ def _run_interactive_cloud(api: ArloCloudAPI, camera_id: str, ccfg: dict,
             api.stop_move(camera_id)
             print("  Stopped.")
         elif cmd_lower in ("h", "home"):
+            _ensure_stream()
             api.go_home(camera_id)
             print("  Returning home.")
 
@@ -400,13 +430,17 @@ def _run_interactive_cloud(api: ArloCloudAPI, camera_id: str, ccfg: dict,
 
         # Patterns
         elif cmd_lower == "sweep":
+            _ensure_stream()
             print("  Sweeping...")
-            for _ in range(8):
-                api.move(camera_id, pan=0.2, speed=speed, duration=0.3)
-                time.sleep(0.5)
-            for _ in range(8):
-                api.move(camera_id, pan=-0.2, speed=speed, duration=0.3)
-                time.sleep(0.5)
+            for _ in range(6):
+                api.move(camera_id, pan=0.5, speed=speed, duration=0.3)
+                time.sleep(0.8)
+            api.stop_move(camera_id)
+            time.sleep(0.5)
+            for _ in range(6):
+                api.move(camera_id, pan=-0.5, speed=speed, duration=0.3)
+                time.sleep(0.8)
+            api.stop_move(camera_id)
             print("  Done.")
 
         elif cmd_lower == "patrol":
@@ -499,6 +533,7 @@ def _run_interactive_cloud(api: ArloCloudAPI, camera_id: str, ccfg: dict,
             new_id = select_camera(api, camera_id, force_pick=True)
             if new_id != camera_id:
                 camera_id = new_id
+                stream_active = False  # Need new stream for new camera
                 if config:
                     config["arlo"]["camera_serial"] = camera_id
                     save_config(config, config_path)
