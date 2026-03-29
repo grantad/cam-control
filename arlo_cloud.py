@@ -464,6 +464,7 @@ class ArloCloudAPI:
 
                 self.cameras[device_id] = cam
                 logger.info(f"Camera: {cam}")
+                logger.debug(f"  parentId={cam.parent_id} model={cam.model} serial={cam.serial}")
 
             elif device_type in ("basestation", "siren", "arlobridge"):
                 self.base_stations[device_id] = dev
@@ -601,7 +602,11 @@ class ArloCloudAPI:
             self._pending[trans_id] = event
 
         url = f"{ARLO_URLS['base']}/users/devices/notify/{parent_id}"
+        logger.debug(f"Notify: {action} {resource} -> {parent_id} (camera={device_id})")
+        logger.debug(f"Notify payload: {json.dumps(payload)}")
         resp = self._post(url, payload)
+
+        logger.debug(f"Notify response: {json.dumps(resp)[:300] if resp else 'None'}")
 
         if not resp:
             return None
