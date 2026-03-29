@@ -602,9 +602,16 @@ class ArloCloudAPI:
             self._pending[trans_id] = event
 
         url = f"{ARLO_URLS['base']}/users/devices/notify/{parent_id}"
-        logger.debug(f"Notify: {action} {resource} -> {parent_id} (camera={device_id})")
+
+        # xcloudId header is required for notify calls
+        xcloud_id = camera.xcloud_id if camera else ""
+        extra_headers = {}
+        if xcloud_id:
+            extra_headers["xcloudId"] = xcloud_id
+
+        logger.debug(f"Notify: {action} {resource} -> {parent_id} (camera={device_id}) xcloud={xcloud_id}")
         logger.debug(f"Notify payload: {json.dumps(payload)}")
-        resp = self._post(url, payload)
+        resp = self._post(url, payload, extra_headers=extra_headers if extra_headers else None)
 
         logger.debug(f"Notify response: {json.dumps(resp)[:300] if resp else 'None'}")
 
