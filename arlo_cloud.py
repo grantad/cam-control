@@ -464,7 +464,8 @@ class ArloCloudAPI:
 
                 self.cameras[device_id] = cam
                 logger.info(f"Camera: {cam}")
-                logger.debug(f"  parentId={cam.parent_id} model={cam.model} serial={cam.serial}")
+                logger.debug(f"  parentId={cam.parent_id} model={cam.model} xcloud={cam.xcloud_id}")
+                logger.debug(f"  Full device keys: {list(dev.keys())}")
 
             elif device_type in ("basestation", "siren", "arlobridge"):
                 self.base_stations[device_id] = dev
