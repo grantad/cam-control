@@ -1,0 +1,27 @@
+network:
+  interface: null   # auto-detect, or specify e.g. "en0"
+  subnet: null      # auto-detect, or specify e.g. "192.168.1.0/24"
+
+arlo:
+  # If you know your base station IP, set it here to skip discovery
+  base_station_ip: null
+  # Captured auth token (populated automatically by intercept mode)
+  auth_token: null
+  # Camera serial to control (populated by discovery)
+  camera_serial: null
+
+intercept:
+  # Port for the HTTPS proxy that captures Arlo app traffic
+  proxy_port: 8888
+  # Where to dump captured commands for analysis
+  capture_dir: ./captures
+  # Auto-extract auth tokens from intercepted traffic
+  auto_extract_token: true
+
+control:
+  # PTZ movement speed (0.0 - 1.0)
+  move_speed: 0.5
+  # Default move duration in seconds
+  move_duration: 0.5
+  # Continuous move step interval
+  step_interval: 0.1

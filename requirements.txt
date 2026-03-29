@@ -1,0 +1,7 @@
+scapy>=2.5
+pyyaml
+requests
+mitmproxy>=10.0
+cryptography
+websockets
+aiohttp
