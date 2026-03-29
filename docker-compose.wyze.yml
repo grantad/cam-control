@@ -1,0 +1,43 @@
+## Wyze Bridge — exposes Wyze cameras via REST API + RTSP
+##
+## Usage:
+##   docker-compose -f docker-compose.wyze.yml up -d
+##   OR:  python main.py wyze-bridge start
+##
+## Before first run:
+##   1. Set a Wyze password: go to wyze.com → "Forgot Password" using your Google email
+##   2. (Optional) Create an API key at https://developer-api-console.wyze.com/
+##
+## Ports:
+##   5000  — REST API (PTZ control, snapshots)
+##   8554  — RTSP streams (rtsp://localhost:8554/{camera-name})
+##   8888  — HLS streams (http://localhost:8888/{camera-name})
+##   8889  — WebRTC streams
+
+services:
+  wyze-bridge:
+    image: mrlt8/wyze-bridge:latest
+    container_name: wyze-bridge
+    restart: unless-stopped
+    ports:
+      - "5000:5000"   # REST API
+      - "8554:8554"   # RTSP
+      - "8888:8888"   # HLS
+      - "8889:8889"   # WebRTC
+    environment:
+      # Required: Wyze credentials (email/password)
+      # Set these via env vars or .env file — do NOT commit passwords
+      - WYZE_EMAIL=${WYZE_EMAIL}
+      - WYZE_PASSWORD=${WYZE_PASSWORD}
+      # Optional: API key auth (more reliable, less rate-limited)
+      - WYZE_KEY_ID=${WYZE_KEY_ID:-}
+      - WYZE_API_KEY=${WYZE_API_KEY:-}
+      # Enable REST API for PTZ control
+      - WB_API=true
+      # Optional: limit to specific cameras (comma-separated nicknames)
+      # - FILTER_NAMES=
+    volumes:
+      - wyze-tokens:/tokens
+
+volumes:
+  wyze-tokens:

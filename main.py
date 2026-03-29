@@ -1,21 +1,24 @@
 #!/usr/bin/env python3
 """
-CamControl — Arlo Camera Hijacker & PTZ Controller
+CamControl — Multi-Brand Camera Hijacker & PTZ Controller
 
-Control your Arlo camera without the Arlo app.
-Supports both direct-WiFi cameras (cloud API) and base station setups (local API).
+Control Arlo and Wyze cameras without the vendor apps.
+Supports cloud API control for both brands.
 
 Usage:
     python main.py discover                        # Find Arlo devices on LAN
-    python main.py cloud-login                     # Auth with Arlo cloud (direct-WiFi cameras)
-    python main.py control                         # Interactive PTZ control (auto-detects mode)
-    python main.py control --mode cloud            # Force cloud mode
-    python main.py control --mode local --base-ip X  # Force local base station mode
-    python main.py move --dir left                 # One-shot movement
+    python main.py cloud-login                     # Auth with Arlo cloud
+    python main.py wyze-login                      # Auth with Wyze cloud
+    python main.py wyze-bridge start               # Start docker-wyze-bridge for PTZ
+    python main.py control                         # Interactive PTZ (auto-detects brand)
+    python main.py control --brand arlo            # Force Arlo
+    python main.py control --brand wyze            # Force Wyze
+    python main.py control --mode local --base-ip X  # Arlo local base station mode
+    python main.py move --dir left                 # One-shot movement (Arlo)
     python main.py intercept --base-ip <IP>        # MITM to capture base station commands
     python main.py replay <capture_file>           # Replay captured commands
 
-Discovery requires root/sudo. Cloud mode does NOT require sudo.
+Discovery/intercept require root/sudo. Cloud mode does NOT require sudo.
 """
 
 import os
@@ -33,6 +36,7 @@ import yaml
 
 from discovery import discover_arlo_devices, print_devices, get_subnet
 from arlo_cloud import ArloCloudAPI
+from wyze_cloud import WyzeCloudAPI
 
 logger = logging.getLogger("camcontrol")
 
@@ -46,6 +50,14 @@ def load_config(path: str = "config.yaml") -> dict:
             "camera_serial": None,
             "email": None,
             "mode": "cloud",  # "cloud" or "local"
+        },
+        "wyze": {
+            "email": None,
+            "password": None,
+            "key_id": None,
+            "api_key": None,
+            "camera_mac": None,
+            "bridge_url": "http://localhost:5000",
         },
         "intercept": {
             "capture_dir": "./captures",
@@ -218,17 +230,35 @@ def cmd_cloud_login(args, config):
 
 
 def cmd_control(args, config):
-    """Interactive PTZ control — works in cloud or local mode."""
-    mode = getattr(args, 'mode', None) or config["arlo"].get("mode", "cloud")
+    """Interactive PTZ control — supports Arlo and Wyze."""
+    brand = getattr(args, 'brand', None)
 
-    print("\n" + "=" * 60)
-    print(f"  CamControl — Interactive Camera Control ({mode} mode)")
-    print("=" * 60)
+    if not brand:
+        # Auto-detect: check which brands have credentials
+        has_arlo = bool(config["arlo"].get("auth_token") or config["arlo"].get("email"))
+        has_wyze = bool(config["wyze"].get("email") or config["wyze"].get("bridge_url"))
+        if has_arlo and has_wyze:
+            choice = input("  Brand [arlo/wyze]: ").strip().lower()
+            brand = choice if choice in ("arlo", "wyze") else "arlo"
+        elif has_wyze:
+            brand = "wyze"
+        else:
+            brand = "arlo"
 
-    if mode == "cloud":
-        _control_cloud(args, config)
+    if brand == "wyze":
+        print("\n" + "=" * 60)
+        print(f"  CamControl — Interactive Camera Control (Wyze cloud)")
+        print("=" * 60)
+        _control_wyze(args, config)
     else:
-        _control_local(args, config)
+        mode = getattr(args, 'mode', None) or config["arlo"].get("mode", "cloud")
+        print("\n" + "=" * 60)
+        print(f"  CamControl — Interactive Camera Control (Arlo {mode})")
+        print("=" * 60)
+        if mode == "cloud":
+            _control_cloud(args, config)
+        else:
+            _control_local(args, config)
 
 
 def _control_cloud(args, config):
@@ -262,6 +292,183 @@ def _control_cloud(args, config):
     print()
 
     _run_interactive_cloud(api, camera_id, ccfg, config, args.config)
+
+
+def _control_wyze(args, config):
+    """Wyze cloud control via wyze-sdk + docker-wyze-bridge."""
+    bridge_url = config["wyze"].get("bridge_url", "http://localhost:5000")
+    api = WyzeCloudAPI(bridge_url=bridge_url)
+
+    # Try auth: wyze-sdk first, then bridge-only
+    email = config["wyze"].get("email")
+    password = config["wyze"].get("password")
+
+    if email and password:
+        key_id = config["wyze"].get("key_id") or ""
+        api_key = config["wyze"].get("api_key") or ""
+        if not api.login(email, password, key_id, api_key):
+            print("  Wyze login failed. Trying bridge-only mode...")
+            if not api.login_with_bridge():
+                print("  Error: Cannot connect to Wyze. Run 'wyze-login' or start the bridge.")
+                sys.exit(1)
+    else:
+        print("  No Wyze credentials saved. Trying bridge-only mode...")
+        if not api.login_with_bridge():
+            print("  Error: Cannot connect to wyze-bridge.")
+            print("  Run 'wyze-login' first, or start the bridge with 'wyze-bridge start'.")
+            sys.exit(1)
+
+    api.get_devices()
+
+    if not api.cameras:
+        print("  No Wyze cameras found.")
+        sys.exit(1)
+
+    # Select camera
+    preferred = config["wyze"].get("camera_mac")
+    camera_id = select_camera_generic(api, preferred)
+    config["wyze"]["camera_mac"] = camera_id
+    save_config(config, args.config)
+
+    # Check bridge for PTZ
+    if not api.check_bridge():
+        print("  Warning: docker-wyze-bridge not reachable at " + bridge_url)
+        print("  PTZ commands will fail. Start it with: python main.py wyze-bridge start")
+
+    print(f"\n  Camera: {api.cameras.get(camera_id, camera_id)}")
+    print()
+
+    _run_interactive(api, camera_id, config, args.config)
+
+
+def select_camera_generic(api, preferred_id: Optional[str] = None) -> str:
+    """Brand-agnostic camera picker."""
+    pool = {k: v for k, v in api.cameras.items() if v.has_ptz}
+    if not pool:
+        pool = api.cameras
+
+    if preferred_id and preferred_id in pool:
+        cam = pool[preferred_id]
+        print(f"  Using camera: {cam}")
+        return preferred_id
+
+    if len(pool) == 1:
+        cid = list(pool.keys())[0]
+        print(f"  Auto-selected: {pool[cid]}")
+        return cid
+
+    print(f"\n  Cameras ({len(pool)}):")
+    items = list(pool.items())
+    for i, (cid, cam) in enumerate(items):
+        marker = " <-- current" if cid == preferred_id else ""
+        print(f"    [{i}] {cam}{marker}")
+
+    try:
+        choice = input("\n  Select camera [0]: ").strip()
+        idx = int(choice) if choice else 0
+        return items[idx][0]
+    except (ValueError, IndexError):
+        return items[0][0]
+
+
+def cmd_wyze_login(args, config):
+    """Authenticate with Wyze and list devices."""
+    print("\n  CamControl — Wyze Login\n")
+
+    api = WyzeCloudAPI(bridge_url=config["wyze"].get("bridge_url", "http://localhost:5000"))
+
+    email = config["wyze"].get("email") or input("  Wyze email: ").strip()
+    password = getpass.getpass("  Wyze password: ")
+    key_id = config["wyze"].get("key_id") or input("  API Key ID (optional, press Enter to skip): ").strip()
+    api_key = ""
+    if key_id:
+        api_key = config["wyze"].get("api_key") or input("  API Key: ").strip()
+
+    if not api.login(email, password, key_id, api_key):
+        print("  Login failed. Check credentials.")
+        print("  Note: If you use Google sign-in, set a Wyze password first:")
+        print("    1. Go to wyze.com → 'Forgot Password'")
+        print("    2. Use the email associated with your Google account")
+        sys.exit(1)
+
+    print("  Login successful!")
+
+    # Save credentials
+    config["wyze"]["email"] = email
+    config["wyze"]["password"] = password  # TODO: use keyring for production
+    if key_id:
+        config["wyze"]["key_id"] = key_id
+        config["wyze"]["api_key"] = api_key
+    save_config(config, args.config)
+
+    print("\n  Fetching devices...")
+    api.get_devices()
+
+    if api.cameras:
+        print(f"\n  Cameras ({len(api.cameras)}):")
+        for cid, cam in api.cameras.items():
+            ptz = " [PTZ]" if cam.has_ptz else ""
+            print(f"    {cam.name}{ptz} — {cam.model} ({cid})")
+
+    # Check bridge
+    if api.check_bridge():
+        print(f"\n  docker-wyze-bridge: RUNNING at {api._bridge_url}")
+    else:
+        print(f"\n  docker-wyze-bridge: NOT RUNNING")
+        print(f"  Start it for PTZ: python main.py wyze-bridge start")
+
+    print(f"\n  Ready! Run:  python main.py control --brand wyze")
+    print()
+    api.close()
+
+
+def cmd_wyze_bridge(args, config):
+    """Start/stop docker-wyze-bridge."""
+    action = getattr(args, 'action', 'start')
+    compose_file = os.path.join(os.path.dirname(__file__) or ".", "docker-compose.wyze.yml")
+
+    if not os.path.exists(compose_file):
+        print(f"  Error: {compose_file} not found")
+        sys.exit(1)
+
+    if action == "start":
+        print("  Starting docker-wyze-bridge...")
+        print("  This requires Docker Desktop or colima to be running.\n")
+
+        # Set env vars from config
+        env = os.environ.copy()
+        wyze_cfg = config.get("wyze", {})
+        if wyze_cfg.get("email"):
+            env["WYZE_EMAIL"] = wyze_cfg["email"]
+        if wyze_cfg.get("password"):
+            env["WYZE_PASSWORD"] = wyze_cfg["password"]
+        if wyze_cfg.get("key_id"):
+            env["WYZE_KEY_ID"] = wyze_cfg["key_id"]
+        if wyze_cfg.get("api_key"):
+            env["WYZE_API_KEY"] = wyze_cfg["api_key"]
+
+        result = subprocess.run(
+            ["docker-compose", "-f", compose_file, "up", "-d"],
+            env=env,
+        )
+        if result.returncode == 0:
+            print("\n  Bridge started! Cameras should appear within 30-60 seconds.")
+            print(f"  REST API: http://localhost:5000")
+            print(f"  RTSP:     rtsp://localhost:8554/<camera-name>")
+        else:
+            print("\n  Failed to start bridge. Is Docker running?")
+            print("  Try: open -a Docker  (or: colima start)")
+
+    elif action == "stop":
+        print("  Stopping docker-wyze-bridge...")
+        subprocess.run(["docker-compose", "-f", compose_file, "down"])
+
+    elif action == "status":
+        result = subprocess.run(
+            ["docker-compose", "-f", compose_file, "ps"],
+            capture_output=True, text=True,
+        )
+        print(result.stdout or "  No containers running.")
 
 
 def _control_local(args, config):
@@ -582,6 +789,266 @@ def _run_interactive_cloud(api: ArloCloudAPI, camera_id: str, ccfg: dict,
     print("  Done.\n")
 
 
+def _run_interactive(api, camera_id: str, config: Optional[dict] = None,
+                     config_path: str = "config.yaml"):
+    """Brand-agnostic interactive control loop. Works with any CameraAPI."""
+    is_arlo = isinstance(api, ArloCloudAPI)
+    is_wyze = isinstance(api, WyzeCloudAPI)
+    brand = "wyze" if is_wyze else "arlo"
+
+    step = 0.05  # Default step size
+    stream_active = False
+    ffmpeg_proc = None
+
+    def _ensure_stream():
+        nonlocal stream_active, camera_id, ffmpeg_proc
+        if stream_active and ffmpeg_proc and ffmpeg_proc.poll() is None:
+            return True
+        if ffmpeg_proc and ffmpeg_proc.poll() is not None:
+            ffmpeg_proc = None
+            stream_active = False
+        if stream_active:
+            return True
+
+        print("  Starting stream...")
+        url = api.start_stream(camera_id)
+        if url:
+            print(f"  Opening live view...")
+            try:
+                ffplay_args = ["ffplay", "-i", url,
+                               "-window_title", "CamControl — Live View",
+                               "-loglevel", "quiet", "-nostats",
+                               "-fast", "-framedrop"]
+                # Arlo uses rtsps (TLS), needs tcp transport
+                if url.startswith("rtsps://"):
+                    ffplay_args = ["ffplay", "-rtsp_transport", "tcp", "-i", url,
+                                   "-window_title", "CamControl — Live View",
+                                   "-loglevel", "quiet", "-nostats",
+                                   "-fast", "-framedrop"]
+                ffmpeg_proc = subprocess.Popen(
+                    ffplay_args,
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+                print(f"  Live view window opened.")
+            except FileNotFoundError:
+                print("  Warning: ffplay not found — no live view.")
+        else:
+            print("  No stream URL (may still work for PTZ).")
+
+        stream_active = True
+        if is_arlo:
+            time.sleep(5)  # Arlo needs time to wake up
+        return True
+
+    def _stop_stream():
+        nonlocal ffmpeg_proc, stream_active
+        if ffmpeg_proc:
+            ffmpeg_proc.terminate()
+            try:
+                ffmpeg_proc.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                ffmpeg_proc.kill()
+            ffmpeg_proc = None
+        stream_active = False
+
+    print("  === Controls ===")
+    print("  Movement:    w/a/s/d or up/down/left/right")
+    print("  Zoom:        +/- or z/x")
+    print("  Home:        h")
+    print("  Stop:        0")
+    print("  Speed:       1-9 (step size)")
+    if is_arlo:
+        print("  Presets:     p1-p9 (goto), sp1-sp9 (save)")
+        print("  Patterns:    sweep, patrol")
+    else:
+        print("  Patterns:    sweep")
+    print("  Camera:      snap, stream, night, nightoff, privacy, privacyoff")
+    print("  Switch:      switch (pick a different camera), list (show all)")
+    print("  Look at:     goto <pan> <tilt> [zoom]")
+    if is_arlo:
+        print("  Raw:         raw <action> <resource> <json>")
+    print("  Quit:        q")
+    print("  " + "-" * 50)
+    print()
+
+    while True:
+        try:
+            cmd = input("  cam> ").strip()
+        except (EOFError, KeyboardInterrupt):
+            break
+
+        if not cmd:
+            continue
+
+        cmd_lower = cmd.lower()
+
+        if cmd_lower in ("q", "quit", "exit"):
+            break
+
+        elif cmd_lower in ("w", "up"):
+            _ensure_stream()
+            api.move(camera_id, tilt=step)
+        elif cmd_lower in ("s", "down"):
+            _ensure_stream()
+            api.move(camera_id, tilt=-step)
+        elif cmd_lower in ("a", "left"):
+            _ensure_stream()
+            api.move(camera_id, pan=-step)
+        elif cmd_lower in ("d", "right"):
+            _ensure_stream()
+            api.move(camera_id, pan=step)
+        elif cmd_lower in ("+", "z", "zi", "zoomin"):
+            _ensure_stream()
+            api.move(camera_id, zoom=step)
+        elif cmd_lower in ("-", "x", "zo", "zoomout"):
+            _ensure_stream()
+            api.move(camera_id, zoom=-step)
+
+        elif cmd_lower in ("wa", "upleft"):
+            _ensure_stream()
+            api.move(camera_id, pan=-step, tilt=step)
+        elif cmd_lower in ("wd", "upright"):
+            _ensure_stream()
+            api.move(camera_id, pan=step, tilt=step)
+        elif cmd_lower in ("sa", "downleft"):
+            _ensure_stream()
+            api.move(camera_id, pan=-step, tilt=-step)
+        elif cmd_lower in ("sd", "downright"):
+            _ensure_stream()
+            api.move(camera_id, pan=step, tilt=-step)
+
+        elif cmd_lower in ("0", "stop"):
+            api.stop_move(camera_id)
+            print("  Stopped.")
+        elif cmd_lower in ("h", "home"):
+            api.go_home(camera_id)
+            print("  Returning home.")
+
+        elif cmd_lower in [str(i) for i in range(1, 10)]:
+            step = int(cmd_lower) * 0.01
+            print(f"  Step size: {step}")
+
+        # Arlo-only: presets
+        elif is_arlo and cmd_lower.startswith("p") and len(cmd_lower) == 2 and cmd_lower[1].isdigit():
+            pid = int(cmd_lower[1])
+            api.go_to_preset(camera_id, pid)
+            print(f"  Going to preset {pid}")
+        elif is_arlo and cmd_lower.startswith("sp") and len(cmd_lower) == 3 and cmd_lower[2].isdigit():
+            pid = int(cmd_lower[2])
+            name = input(f"  Preset {pid} name: ").strip()
+            api.set_preset(camera_id, pid, name)
+            print(f"  Saved preset {pid}")
+
+        elif cmd_lower == "sweep":
+            _ensure_stream()
+            print("  Sweeping...")
+            for _ in range(6):
+                api.move(camera_id, pan=step)
+                time.sleep(0.8)
+            api.stop_move(camera_id)
+            time.sleep(0.5)
+            for _ in range(6):
+                api.move(camera_id, pan=-step)
+                time.sleep(0.8)
+            api.stop_move(camera_id)
+            print("  Done.")
+
+        elif is_arlo and cmd_lower == "patrol":
+            api.start_patrol(camera_id)
+            print("  Patrol started. Type 'stop' to end.")
+
+        elif cmd_lower.startswith("goto "):
+            parts = cmd_lower.split()
+            try:
+                pan = float(parts[1])
+                tilt = float(parts[2])
+                zoom = float(parts[3]) if len(parts) > 3 else 0.0
+                api.move_to(camera_id, pan, tilt, zoom)
+                print(f"  Moving to pan={pan} tilt={tilt} zoom={zoom}")
+            except (IndexError, ValueError):
+                print("  Usage: goto <pan> <tilt> [zoom]")
+
+        elif cmd_lower == "snap":
+            url = api.trigger_snapshot(camera_id) if hasattr(api, 'trigger_snapshot') else None
+            print(f"  Snapshot: {url or 'triggered (no URL returned)'}")
+        elif cmd_lower == "stream":
+            url = api.start_stream(camera_id)
+            print(f"  Stream: {url or 'started (no URL returned)'}")
+        elif cmd_lower == "night":
+            api.toggle_night_vision(camera_id, True)
+            print("  Night vision ON")
+        elif cmd_lower == "nightoff":
+            api.toggle_night_vision(camera_id, False)
+            print("  Night vision OFF")
+        elif cmd_lower == "privacy":
+            api.toggle_privacy(camera_id, True)
+            print("  Privacy mode ON (camera off)")
+        elif cmd_lower == "privacyoff":
+            api.toggle_privacy(camera_id, False)
+            print("  Privacy mode OFF (camera active)")
+
+        elif cmd_lower == "test":
+            _ensure_stream()
+            print("  Testing PTZ...")
+            for label, x, y in [("RIGHT", 0.05, 0), ("LEFT", -0.05, 0),
+                                 ("UP", 0, 0.05), ("DOWN", 0, -0.05)]:
+                api.move(camera_id, pan=x, tilt=y)
+                print(f"  {label}: sent")
+                time.sleep(2)
+            api.go_home(camera_id)
+            print("  HOME: sent. Watch the live view!")
+
+        elif is_arlo and cmd_lower.startswith("raw "):
+            parts = cmd.split(maxsplit=3)
+            if len(parts) < 4:
+                print("  Usage: raw <action> <resource> <json>")
+                continue
+            try:
+                props = json.loads(parts[3])
+                result = api.send_raw(camera_id, parts[1], parts[2], props)
+                print(f"  Result: {json.dumps(result, indent=2) if result else 'no response'}")
+            except json.JSONDecodeError:
+                print("  Error: Invalid JSON")
+
+        elif cmd_lower in ("switch", "sw"):
+            new_id = select_camera_generic(api, camera_id)
+            if new_id != camera_id:
+                _stop_stream()
+                camera_id = new_id
+                if config:
+                    key = "camera_mac" if is_wyze else "camera_serial"
+                    config[brand][key] = camera_id
+                    save_config(config, config_path)
+            print(f"  Now controlling: {api.cameras.get(camera_id, camera_id)}")
+
+        elif cmd_lower in ("list", "ls", "cameras"):
+            for cid, cam in api.cameras.items():
+                marker = " <-- active" if cid == camera_id else ""
+                print(f"  {cam}{marker}")
+
+        elif cmd_lower in ("status", "info"):
+            cam = api.cameras.get(camera_id)
+            if cam:
+                print(f"  Name:  {cam.name}")
+                print(f"  Model: {cam.model}")
+                print(f"  PTZ:   {cam.has_ptz}")
+                print(f"  State: {cam.state}")
+                print(f"  ID:    {cam.device_id}")
+            print(f"  Brand: {brand}")
+            print(f"  Step:  {step}")
+
+        else:
+            print(f"  Unknown: {cmd}")
+            print("  w/a/s/d=move, +/-=zoom, h=home, switch=change camera, q=quit")
+
+    print("\n  Disconnecting...")
+    _stop_stream()
+    api.close()
+    print("  Done.\n")
+
+
 def _run_interactive_local(ctrl, api):
     """Interactive control loop using local base station API (same as before)."""
     from controller import CameraController
@@ -790,13 +1257,21 @@ def main():
     p.add_argument("--base-ip", help="Known base station IP")
     p.add_argument("--save", action="store_true", help="Save to config")
 
-    # cloud-login
+    # cloud-login (Arlo)
     sub.add_parser("cloud-login", help="Authenticate with Arlo cloud")
+
+    # wyze-login
+    sub.add_parser("wyze-login", help="Authenticate with Wyze cloud")
+
+    # wyze-bridge
+    p = sub.add_parser("wyze-bridge", help="Manage docker-wyze-bridge")
+    p.add_argument("action", choices=["start", "stop", "status"], help="Bridge action")
 
     # control
     p = sub.add_parser("control", help="Interactive PTZ control")
-    p.add_argument("--mode", choices=["cloud", "local"], help="Control mode")
-    p.add_argument("--base-ip", help="Base station IP (local mode)")
+    p.add_argument("--brand", choices=["arlo", "wyze"], help="Camera brand")
+    p.add_argument("--mode", choices=["cloud", "local"], help="Control mode (Arlo)")
+    p.add_argument("--base-ip", help="Base station IP (Arlo local mode)")
     p.add_argument("--token", help="Auth token")
     p.add_argument("--camera", help="Camera device ID")
 
@@ -846,6 +1321,8 @@ def main():
     dispatch = {
         "discover": cmd_discover,
         "cloud-login": cmd_cloud_login,
+        "wyze-login": cmd_wyze_login,
+        "wyze-bridge": cmd_wyze_bridge,
         "control": cmd_control,
         "move": cmd_move,
         "intercept": cmd_intercept,

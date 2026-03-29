@@ -6,3 +6,4 @@ urllib3
 cloudscraper
 paho-mqtt>=2.0
 aiortc>=1.6.0
+wyze-sdk>=2.1.0
