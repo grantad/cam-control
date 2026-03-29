@@ -260,16 +260,22 @@ class ArloCloudAPI:
         self.token = token
         self.session.headers["Authorization"] = token
 
-        resp = self._get(f"{ARLO_URLS['base']}/users/profile")
-        if resp and resp.get("data") and isinstance(resp["data"], dict):
-            data = resp["data"]
-            # Check it's a real profile, not an error response
-            if data.get("userId") and not data.get("error"):
-                self.user_id = data["userId"]
-                self.authenticated = True
-                self.web_id = f"{self.user_id}_web"
-                logger.info(f"Token auth successful: {self.user_id}")
-                return True
+        # Establish session first
+        session_resp = self._get(f"{ARLO_URLS['base']}/users/session/v3")
+        if session_resp and session_resp.get("data") and isinstance(session_resp["data"], dict):
+            data = session_resp["data"]
+            if not data.get("error"):
+                logger.debug("Session established with saved token")
+                # Now validate with profile
+                resp = self._get(f"{ARLO_URLS['base']}/users/profile")
+                if resp and resp.get("data") and isinstance(resp["data"], dict):
+                    profile = resp["data"]
+                    if profile.get("userId") and not profile.get("error"):
+                        self.user_id = profile["userId"]
+                        self.authenticated = True
+                        self.web_id = f"{self.user_id}_web"
+                        logger.info(f"Token auth successful: {self.user_id}")
+                        return True
 
         logger.info("Saved token expired or invalid")
         self.token = ""
@@ -285,10 +291,32 @@ class ArloCloudAPI:
             logger.error("No token in auth response")
             return False
 
-        self.authenticated = True
         self.web_id = f"{self.user_id}_web"
+
+        # Step 1: Validate the token on the auth server
+        token_b64 = base64.b64encode(self.token.encode()).decode()
+        validate_headers = {"Authorization": token_b64}
+        ts = int(time.time() * 1000)
+        resp = self._auth_get(
+            f"{ARLO_URLS['auth']}/validateAccessToken?data={ts}",
+            extra_headers=validate_headers,
+        )
+        if resp:
+            logger.debug(f"Token validated: {resp.get('meta', {}).get('code')}")
+        else:
+            logger.warning("Token validation call failed (continuing anyway)")
+
+        # Step 2: Set up API session headers with raw token
         self.session.headers["Authorization"] = self.token
 
+        # Step 3: Establish session on myapi.arlo.com (CRITICAL)
+        session_resp = self._get(f"{ARLO_URLS['base']}/users/session/v3")
+        if session_resp and session_resp.get("data"):
+            logger.debug(f"Session established: {json.dumps(session_resp['data'])[:200]}")
+        else:
+            logger.warning("Session establishment may have failed")
+
+        self.authenticated = True
         logger.info(f"Authenticated as {self.user_id}")
         return True
 
