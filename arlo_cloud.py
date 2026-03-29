@@ -95,6 +95,7 @@ class ArloCloudAPI:
             "Referer": "https://my.arlo.com/",
             "Source": "arloCamWeb",
             "User-Agent": "(iPhone15,2 18_1_1) iOS Arlo 5.4.3",
+            "X-Service-Version": "3",
             "X-User-Device-Automation-Name": "Q2FtQ29udHJvbA==",  # base64("CamControl")
             "X-User-Device-Id": self._device_id,
             "X-User-Device-Type": "BROWSER",
@@ -163,30 +164,33 @@ class ArloCloudAPI:
         meta = resp.get("meta", {})
         code = meta.get("code", 0)
 
-        # Always grab the token if present
         token = data.get("token", "")
-        authenticated = data.get("authenticated", data.get("authCompleted", False))
+        auth_completed = data.get("authCompleted", False)
 
-        logger.debug(f"Auth response: code={code} authenticated={authenticated} has_token={bool(token)}")
+        logger.debug(f"Auth response: code={code} authCompleted={auth_completed} has_token={bool(token)}")
+        logger.debug(f"Auth data keys: {list(data.keys())}")
 
-        if code == 200 and token and authenticated:
+        if not token:
+            logger.error(f"Login failed: {meta.get('message', 'unknown error')} (code={code})")
+            return False
+
+        # Store token for 2FA flow
+        self._auth_token_partial = token
+
+        if auth_completed:
             # Fully authenticated (no 2FA needed)
             return self._complete_auth(data)
 
-        if token:
-            # Got a token but auth not complete — 2FA required
-            self._auth_token_partial = token
-            self._factor_id = data.get("factorAuthId", "")
+        # 2FA required
+        self._factor_id = data.get("factorAuthId", "")
+        if not self._factor_id:
+            self._factor_id = self._start_2fa()
 
-            # Need to get factors and start 2FA
-            if not self._factor_id:
-                self._factor_id = self._start_2fa()
+        if self._factor_id:
+            logger.info("2FA required. Call verify_2fa() with the code.")
+            return False
 
-            if self._factor_id:
-                logger.info("2FA required. Call verify_2fa() with the code.")
-                return False
-
-        logger.error(f"Login failed: {meta.get('message', 'unknown error')} (code={code})")
+        logger.error(f"Login failed: no 2FA factor available (code={code})")
         return False
 
     def _start_2fa(self) -> str:
@@ -231,7 +235,9 @@ class ArloCloudAPI:
             logger.error("No pending 2FA. Call login() first.")
             return False
 
-        headers = {"Authorization": self._auth_token_partial}
+        # Use base64-encoded partial token for auth header
+        token_b64 = base64.b64encode(self._auth_token_partial.encode()).decode()
+        headers = {"Authorization": token_b64}
 
         resp = self._auth_post(
             f"{ARLO_URLS['auth']}/finishAuth",
@@ -245,18 +251,10 @@ class ArloCloudAPI:
         data = resp.get("data", {})
         meta = resp.get("meta", {})
 
+        logger.debug(f"2FA response: code={meta.get('code')} keys={list(data.keys())}")
+
         if meta.get("code") == 200 and data.get("token"):
             return self._complete_auth(data)
-
-        # Try alternative endpoint
-        resp = self._auth_post(
-            f"{ARLO_URLS['auth']}/validateAccessToken",
-            {"factorAuthCode": code},
-            extra_headers=headers,
-        )
-
-        if resp and resp.get("data", {}).get("token"):
-            return self._complete_auth(resp["data"])
 
         logger.error(f"2FA failed: {meta.get('message', 'invalid code')}")
         return False
@@ -300,17 +298,19 @@ class ArloCloudAPI:
         self.web_id = f"{self.user_id}_web"
 
         # Step 1: Validate the token on the auth server
+        # pyaarlo uses base64(token) as Authorization and spaces around = in URL
         token_b64 = base64.b64encode(self.token.encode()).decode()
         validate_headers = {"Authorization": token_b64}
-        ts = int(time.time() * 1000)
+        ts = int(time.time())
         resp = self._auth_get(
-            f"{ARLO_URLS['auth']}/validateAccessToken?data={ts}",
+            f"{ARLO_URLS['auth']}/validateAccessToken?data = {ts}",
             extra_headers=validate_headers,
         )
-        if resp:
-            logger.debug(f"Token validated: {resp.get('meta', {}).get('code')}")
+        if resp and resp.get("meta", {}).get("code") == 200:
+            logger.debug("Token validated successfully")
         else:
-            logger.warning("Token validation call failed (continuing anyway)")
+            logger.debug(f"Token validation: {resp}")
+            # May still work — continue
 
         # Step 2: Set up API session headers with raw token
         self.session.headers["Authorization"] = self.token
