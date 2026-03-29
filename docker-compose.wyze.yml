@@ -6,10 +6,10 @@
 ##
 ## Before first run:
 ##   1. Set a Wyze password: go to wyze.com → "Forgot Password" using your Google email
-##   2. (Optional) Create an API key at https://developer-api-console.wyze.com/
+##   2. Create an API key at https://developer-api-console.wyze.com/
 ##
 ## Ports:
-##   5000  — REST API (PTZ control, snapshots)
+##   5151  — REST API (PTZ control, snapshots) — avoids macOS AirPlay on 5000
 ##   8554  — RTSP streams (rtsp://localhost:8554/{camera-name})
 ##   8888  — HLS streams (http://localhost:8888/{camera-name})
 ##   8889  — WebRTC streams
@@ -20,22 +20,26 @@ services:
     container_name: wyze-bridge
     restart: unless-stopped
     ports:
-      - "5000:5000"   # REST API
+      - "5151:5000"   # REST API (host:container)
       - "8554:8554"   # RTSP
       - "8888:8888"   # HLS
       - "8889:8889"   # WebRTC
+      - "1935:1935"   # RTMP
     environment:
-      # Required: Wyze credentials (email/password)
-      # Set these via env vars or .env file — do NOT commit passwords
       - WYZE_EMAIL=${WYZE_EMAIL}
       - WYZE_PASSWORD=${WYZE_PASSWORD}
-      # Optional: API key auth (more reliable, less rate-limited)
-      - WYZE_KEY_ID=${WYZE_KEY_ID:-}
-      - WYZE_API_KEY=${WYZE_API_KEY:-}
-      # Enable REST API for PTZ control
+      - API_ID=${WYZE_KEY_ID:-}
+      - API_KEY=${WYZE_API_KEY:-}
+      # API and auth
       - WB_API=true
-      # Optional: limit to specific cameras (comma-separated nicknames)
-      # - FILTER_NAMES=
+      - WB_AUTH=false
+      # TUTK P2P: use relay mode to avoid NAT/Docker networking issues
+      - NET_MODE=LAN
+      - ENABLE_AUDIO=true
+      # On-demand streaming: only connect when someone requests
+      - ON_DEMAND=true
+      # Timeout: give cameras more time to connect
+      - CONNECT_TIMEOUT=60
     volumes:
       - wyze-tokens:/tokens
 
