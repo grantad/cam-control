@@ -127,7 +127,7 @@ def cloud_login(config: dict, config_path: str) -> ArloCloudAPI:
     return api
 
 
-def select_camera(api: ArloCloudAPI, preferred_id: Optional[str] = None) -> str:
+def select_camera(api: ArloCloudAPI, preferred_id: Optional[str] = None, force_pick: bool = False) -> str:
     """Select a camera from the API's device list."""
     if not api.cameras:
         api.get_devices()
@@ -136,26 +136,27 @@ def select_camera(api: ArloCloudAPI, preferred_id: Optional[str] = None) -> str:
         print("  No cameras found on your Arlo account.")
         sys.exit(1)
 
-    # Try preferred ID
-    if preferred_id and preferred_id in api.cameras:
-        cam = api.cameras[preferred_id]
-        print(f"  Using camera: {cam}")
-        return preferred_id
-
-    # Auto-select PTZ camera
+    # Auto-select PTZ camera pool
     ptz_cameras = {k: v for k, v in api.cameras.items() if v.has_ptz}
     pool = ptz_cameras if ptz_cameras else api.cameras
 
-    if len(pool) == 1:
+    # Use preferred if it exists and we're not forcing a pick
+    if preferred_id and preferred_id in pool and not force_pick:
+        cam = pool[preferred_id]
+        print(f"  Using camera: {cam}")
+        return preferred_id
+
+    if len(pool) == 1 and not force_pick:
         cid = list(pool.keys())[0]
         print(f"  Auto-selected: {pool[cid]}")
         return cid
 
-    # Multiple cameras — let user pick
+    # Show picker
     print(f"\n  Cameras ({len(pool)}):")
     items = list(pool.items())
     for i, (cid, cam) in enumerate(items):
-        print(f"    [{i}] {cam}")
+        marker = " <-- current" if cid == preferred_id else ""
+        print(f"    [{i}] {cam}{marker}")
 
     try:
         choice = input("\n  Select camera [0]: ").strip()
@@ -234,9 +235,15 @@ def _control_cloud(args, config):
     api = cloud_login(config, args.config)
     api.get_devices()
 
+    # If --camera is passed, use it; otherwise always show picker
+    explicit_camera = getattr(args, 'camera', None)
+    saved_camera = config["arlo"]["camera_serial"]
+    force_pick = not explicit_camera  # show picker unless explicitly specified
+
     camera_id = select_camera(
         api,
-        getattr(args, 'camera', None) or config["arlo"]["camera_serial"],
+        explicit_camera or saved_camera,
+        force_pick=force_pick,
     )
 
     # Save selection
@@ -253,7 +260,7 @@ def _control_cloud(args, config):
     print(f"  Speed:  {ccfg['move_speed']}")
     print()
 
-    _run_interactive_cloud(api, camera_id, ccfg)
+    _run_interactive_cloud(api, camera_id, ccfg, config, args.config)
 
 
 def _control_local(args, config):
@@ -303,7 +310,8 @@ def _control_local(args, config):
     _run_interactive_local(ctrl, api)
 
 
-def _run_interactive_cloud(api: ArloCloudAPI, camera_id: str, ccfg: dict):
+def _run_interactive_cloud(api: ArloCloudAPI, camera_id: str, ccfg: dict,
+                           config: Optional[dict] = None, config_path: str = "config.yaml"):
     """Interactive control loop using cloud API."""
     speed = ccfg["move_speed"]
     step = 0.15
@@ -318,6 +326,7 @@ def _run_interactive_cloud(api: ArloCloudAPI, camera_id: str, ccfg: dict):
     print("  Presets:     p1-p9 (goto), sp1-sp9 (save)")
     print("  Patterns:    sweep, patrol")
     print("  Camera:      snap, stream, night, nightoff, privacy, privacyoff")
+    print("  Switch:      switch (pick a different camera), list (show all)")
     print("  Look at:     goto <pan> <tilt> [zoom]")
     print("  Raw:         raw <action> <resource> <json_properties>")
     print("  Quit:        q")
@@ -450,6 +459,22 @@ def _run_interactive_cloud(api: ArloCloudAPI, camera_id: str, ccfg: dict):
                 print("  Error: Invalid JSON properties")
 
         # Info
+        # Switch camera
+        elif cmd_lower in ("switch", "sw"):
+            new_id = select_camera(api, camera_id, force_pick=True)
+            if new_id != camera_id:
+                camera_id = new_id
+                if config:
+                    config["arlo"]["camera_serial"] = camera_id
+                    save_config(config, config_path)
+            print(f"  Now controlling: {api.cameras.get(camera_id, camera_id)}")
+
+        # List cameras
+        elif cmd_lower in ("list", "ls", "cameras"):
+            for cid, cam in api.cameras.items():
+                marker = " <-- active" if cid == camera_id else ""
+                print(f"  {cam}{marker}")
+
         elif cmd_lower in ("status", "info"):
             cam = api.cameras.get(camera_id)
             if cam:
@@ -462,7 +487,7 @@ def _run_interactive_cloud(api: ArloCloudAPI, camera_id: str, ccfg: dict):
 
         else:
             print(f"  Unknown: {cmd}")
-            print("  w/a/s/d=move, +/-=zoom, h=home, q=quit")
+            print("  w/a/s/d=move, +/-=zoom, h=home, switch=change camera, q=quit")
 
     print("\n  Disconnecting...")
     api.close()
