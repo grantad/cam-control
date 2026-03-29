@@ -261,15 +261,18 @@ class ArloCloudAPI:
         self.session.headers["Authorization"] = token
 
         resp = self._get(f"{ARLO_URLS['base']}/users/profile")
-        if resp and resp.get("data"):
+        if resp and resp.get("data") and isinstance(resp["data"], dict):
             data = resp["data"]
-            self.user_id = data.get("userId", "")
-            self.authenticated = True
-            self.web_id = f"{self.user_id}_web"
-            logger.info(f"Token auth successful: {self.user_id}")
-            return True
+            # Check it's a real profile, not an error response
+            if data.get("userId") and not data.get("error"):
+                self.user_id = data["userId"]
+                self.authenticated = True
+                self.web_id = f"{self.user_id}_web"
+                logger.info(f"Token auth successful: {self.user_id}")
+                return True
 
-        logger.error("Token invalid or expired")
+        logger.info("Saved token expired or invalid")
+        self.token = ""
         self.session.headers.pop("Authorization", None)
         return False
 
@@ -299,14 +302,22 @@ class ArloCloudAPI:
 
         # Try v2 endpoint first, fall back to v1
         resp = self._get(f"{ARLO_URLS['base']}/v2/users/devices")
-        if not resp or not resp.get("data"):
-            resp = self._get(f"{ARLO_URLS['base']}/users/devices")
+        data = resp.get("data") if resp else None
 
-        if not resp or not resp.get("data"):
+        # Check for error in data (expired session, etc.)
+        if isinstance(data, dict) and data.get("error"):
+            logger.error(f"Device list error: {data.get('message', data.get('error'))}")
+            data = None
+
+        if not data or not isinstance(data, list):
+            resp = self._get(f"{ARLO_URLS['base']}/users/devices")
+            data = resp.get("data") if resp else None
+
+        if not data or not isinstance(data, list):
             logger.error("Failed to get device list")
             return False
 
-        devices = resp["data"]
+        devices = data
         if not isinstance(devices, list):
             logger.debug(f"Unexpected devices format: {type(devices)}: {str(devices)[:200]}")
             devices = [devices] if isinstance(devices, dict) else []
