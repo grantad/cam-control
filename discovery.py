@@ -366,13 +366,21 @@ def print_devices(base_stations: list[ArloDevice], cameras: list[ArloDevice]):
 
     if cameras:
         print(f"  Cameras ({len(cameras)}):")
-        print(f"  {'IP':<16} {'MAC':<18} {'Model':<14} {'PTZ':<6} {'Ports'}")
-        print(f"  {'-'*16} {'-'*18} {'-'*14} {'-'*6} {'-'*15}")
+        print(f"  {'IP':<16} {'MAC':<18} {'Model':<14} {'Type':<12} {'PTZ':<6} {'Ports'}")
+        print(f"  {'-'*16} {'-'*18} {'-'*14} {'-'*12} {'-'*6} {'-'*15}")
         for cam in cameras:
-            ports_str = ",".join(str(p) for p in cam.open_ports)
+            ports_str = ",".join(str(p) for p in cam.open_ports) or "none"
             ptz_str = "Yes" if cam.has_ptz else "-"
+            cam_type = "direct-wifi" if not cam.open_ports else "local"
             print(
                 f"  {cam.ip:<16} {cam.mac:<18} "
-                f"{cam.model or '-':<14} {ptz_str:<6} {ports_str}"
+                f"{cam.model or '-':<14} {cam_type:<12} {ptz_str:<6} {ports_str}"
             )
         print()
+        # Check for direct-WiFi cameras
+        direct_wifi = [c for c in cameras if not c.open_ports]
+        if direct_wifi:
+            print("  Note: Direct-WiFi cameras have no local API.")
+            print("  Use cloud mode:  python main.py cloud-login")
+            print("  Then control:    python main.py control --mode cloud")
+            print()
