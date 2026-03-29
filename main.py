@@ -447,18 +447,27 @@ def _run_interactive_cloud(api: ArloCloudAPI, camera_id: str, ccfg: dict,
 
         # Probe PTZ formats
         elif cmd_lower == "test":
-            print("  Testing PTZ command formats...")
+            print("  Testing PTZ command formats (ONVIF-style)...")
             tests = [
-                ("cameras/ptz", {"action": "move", "pan": 1, "tilt": 0, "zoom": 0, "speed": 5, "duration": 1}),
-                ("cameras/ptz", {"action": "move", "pan": 10, "tilt": 0, "zoom": 0}),
-                ("cameras/ptz", {"direction": "right", "speed": 5}),
-                ("cameras/ptz", {"action": "right"}),
-                (f"cameras/{camera_id}", {"ptz": {"pan": 10, "tilt": 0}}),
-                (f"cameras/{camera_id}", {"action": "ptzMove", "direction": "right"}),
-                ("ptz", {"action": "move", "direction": "right"}),
+                # ONVIF continuous move formats
+                ("cameras/ptz", {"action": "continuousMove", "velocity": {"panTiltSpaces": {"velocityGenericSpace": {"x": 0.5, "y": 0.0}}}}),
+                ("cameras/ptz", {"continuousMove": {"velocity": {"panTiltSpaces": {"velocityGenericSpace": {"x": 0.5, "y": 0.0}}}}}),
+                # ONVIF relative move
+                ("cameras/ptz", {"action": "relativeMove", "translation": {"panTiltSpaces": {"translationGenericSpace": {"x": 0.1, "y": 0.0}}}}),
+                # ONVIF absolute move
+                ("cameras/ptz", {"action": "absoluteMove", "position": {"panTiltSpaces": {"positionGenericSpace": {"x": 0.1, "y": 0.0}}}}),
+                # Position set (matching the event format exactly)
+                ("cameras/ptz", {"position": {"panTiltSpaces": {"positionGenericSpace": {"x": 0.5, "y": 0.0}}}}),
+                # Simple ONVIF-like with velocity
+                ("cameras/ptz", {"velocity": {"x": 0.5, "y": 0.0}}),
+                # Try with panTilt directly
+                ("cameras/ptz", {"panTilt": {"x": 0.1, "y": 0.0}}),
+                # Integer values in ONVIF format
+                ("cameras/ptz", {"action": "continuousMove", "velocity": {"panTiltSpaces": {"velocityGenericSpace": {"x": 1, "y": 0}}}}),
+                # Simple x/y move
                 ("cameras/ptz", {"action": "move", "x": 1, "y": 0}),
-                ("cameras/ptz", {"action": "right", "speed": 1}),
-                ("cameras/ptz", {"movePan": 10}),
+                # Direction string
+                ("cameras/ptz", {"action": "right"}),
             ]
             for resource, props in tests:
                 result = api.send_raw(camera_id, "set", resource, props)
