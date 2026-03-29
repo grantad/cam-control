@@ -307,9 +307,16 @@ class ArloCloudAPI:
             return False
 
         devices = resp["data"]
+        if not isinstance(devices, list):
+            logger.debug(f"Unexpected devices format: {type(devices)}: {str(devices)[:200]}")
+            devices = [devices] if isinstance(devices, dict) else []
         logger.info(f"Found {len(devices)} devices")
+        logger.debug(f"Device types: {[type(d).__name__ for d in devices]}")
 
         for dev in devices:
+            if not isinstance(dev, dict):
+                logger.debug(f"Skipping non-dict device entry: {dev}")
+                continue
             device_type = dev.get("deviceType", "").lower()
             device_id = dev.get("deviceId", "")
             model = dev.get("modelId", "").lower()
