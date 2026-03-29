@@ -11,6 +11,7 @@ Auth flow reverse-engineered from pyaarlo (twrecked/pyaarlo).
 
 import base64
 import json
+import random
 import time
 import logging
 import threading
@@ -18,18 +19,24 @@ import uuid
 import ssl
 from typing import Optional, Any, Callable
 from dataclasses import dataclass, field
+from urllib.parse import urlparse
 
 import cloudscraper
 import requests
 
+try:
+    import paho.mqtt.client as mqtt
+    HAS_MQTT = True
+except ImportError:
+    HAS_MQTT = False
+
 logger = logging.getLogger(__name__)
 
-# Correct Arlo API endpoints (from pyaarlo reverse engineering)
+# Arlo API endpoints (from pyaarlo reverse engineering)
+# MQTT broker URL is dynamic — extracted from session/v3 response.
 ARLO_URLS = {
     "base":       "https://myapi.arlo.com/hmsweb",
     "auth":       "https://ocapi-app.arlo.com/api",
-    "mqtt_host":  "mqtt-cluster.arloxcld.com",
-    "mqtt_port":  443,
 }
 
 # Known PTZ-capable Arlo models (direct WiFi)
@@ -124,9 +131,13 @@ class ArloCloudAPI:
         self.cameras: dict[str, ArloCloudCamera] = {}
         self.base_stations: dict[str, dict] = {}
 
-        # Event stream
+        # Event stream (MQTT preferred, SSE fallback)
         self._event_thread: Optional[threading.Thread] = None
         self._event_running = False
+        self._mqtt_client = None
+        self._mqtt_connected = threading.Event()
+        self._mqtt_host = ""
+        self._mqtt_port = 0
         self._trans_id = 0
         self._trans_lock = threading.Lock()
         self._pending: dict[str, threading.Event] = {}
@@ -342,6 +353,7 @@ class ArloCloudAPI:
             data = session_resp["data"]
             if not data.get("error"):
                 logger.debug("Session established with saved token")
+                self._extract_mqtt_url(data)
                 # Now validate with profile
                 resp = self._get(f"{ARLO_URLS['base']}/users/profile")
                 if resp and resp.get("data") and isinstance(resp["data"], dict):
@@ -357,6 +369,16 @@ class ArloCloudAPI:
         self.token = ""
         self.session.headers.pop("Authorization", None)
         return False
+
+    def _extract_mqtt_url(self, session_data: dict):
+        """Extract MQTT broker URL from session/v3 response."""
+        mqtt_url = session_data.get("mqttUrl", "")
+        if not mqtt_url:
+            return
+        parsed = urlparse(mqtt_url)
+        self._mqtt_host = parsed.hostname or ""
+        self._mqtt_port = parsed.port or 8883
+        logger.info(f"MQTT broker: {self._mqtt_host}:{self._mqtt_port} (from {mqtt_url})")
 
     def _complete_auth(self, data: dict) -> bool:
         """Complete authentication with token data."""
@@ -391,6 +413,7 @@ class ArloCloudAPI:
         session_resp = self._get(f"{ARLO_URLS['base']}/users/session/v3")
         if session_resp and session_resp.get("data"):
             logger.debug(f"Session established: {json.dumps(session_resp['data'])[:200]}")
+            self._extract_mqtt_url(session_resp["data"])
         else:
             logger.warning("Session establishment may have failed")
 
@@ -473,22 +496,107 @@ class ArloCloudAPI:
 
         return True
 
-    # === Event Stream (SSE) ===
+    # === Event Stream (MQTT preferred, SSE fallback) ===
 
-    def start_event_stream(self):
-        """Start the SSE event stream for async command responses."""
+    def start_event_stream(self, prefer_mqtt: bool = False):
+        """Start event stream. SSE by default; MQTT optional for PTZ position events."""
         if self._event_running:
             return
 
         self._event_running = True
+
+        # MQTT only when explicitly requested (e.g. non-interactive scripts)
+        if prefer_mqtt and HAS_MQTT and self._mqtt_host:
+            if self._start_mqtt():
+                logger.info("Event stream: MQTT connected")
+                return
+
+        # SSE — reliable for interactive use, no terminal corruption
+        logger.info("Event stream: SSE")
         self._event_thread = threading.Thread(
-            target=self._event_loop, daemon=True, name="arlo-sse"
+            target=self._sse_loop, daemon=True, name="arlo-sse"
         )
         self._event_thread.start()
         time.sleep(2)
 
-    def _event_loop(self):
-        """Listen to Arlo's SSE event stream."""
+    # --- MQTT ---
+
+    def _start_mqtt(self) -> bool:
+        """Connect to Arlo's MQTT broker for event listening."""
+        rand_suffix = "".join(str(random.randint(0, 9)) for _ in range(10))
+        client_id = f"user_{self.user_id}_{rand_suffix}"
+
+        self._mqtt_client = mqtt.Client(
+            client_id=client_id,
+            transport="tcp",
+            callback_api_version=mqtt.CallbackAPIVersion.VERSION2,
+        )
+
+        ctx = ssl.create_default_context()
+        self._mqtt_client.tls_set_context(ctx)
+        self._mqtt_client.username_pw_set(self.user_id, self.token)
+
+        self._mqtt_client.on_connect = self._mqtt_on_connect
+        self._mqtt_client.on_message = self._mqtt_on_message
+        self._mqtt_client.on_disconnect = self._mqtt_on_disconnect
+
+        try:
+            self._mqtt_client.connect(self._mqtt_host, port=self._mqtt_port, keepalive=60)
+            self._mqtt_client.loop_start()
+        except Exception as e:
+            logger.warning(f"MQTT connection failed: {e}")
+            self._mqtt_client = None
+            return False
+
+        if not self._mqtt_connected.wait(timeout=15):
+            logger.warning("MQTT connection timeout")
+            self._mqtt_client.loop_stop()
+            self._mqtt_client = None
+            return False
+
+        return True
+
+    def _mqtt_on_connect(self, client, userdata, flags, rc, properties=None):
+        if rc != 0:
+            logger.warning(f"MQTT connect failed: rc={rc}")
+            return
+
+        logger.debug("MQTT connected, subscribing to device topics")
+
+        # Subscribe to all camera out-topics for events
+        topics = []
+        for cam in self.cameras.values():
+            xc = cam.xcloud_id
+            cid = cam.device_id
+            topics.append((f"d/{xc}/out/cameras/{cid}/#", 0))
+            topics.append((f"d/{xc}/out/basestation/#", 0))
+            topics.append((f"d/{xc}/out/devices/#", 0))
+
+        if topics:
+            client.subscribe(topics)
+            logger.debug(f"MQTT subscribed to {len(topics)} topics")
+
+        self._mqtt_connected.set()
+
+    def _mqtt_on_message(self, client, userdata, msg):
+        try:
+            raw = msg.payload
+            # Skip non-JSON payloads (binary data with \r can corrupt terminal)
+            if not raw or raw[0:1] not in (b'{', b'['):
+                return
+            event = json.loads(raw.decode("utf-8"))
+        except (json.JSONDecodeError, UnicodeDecodeError, IndexError):
+            return
+        self._handle_event(event)
+
+    def _mqtt_on_disconnect(self, client, userdata, flags, rc, properties=None):
+        if self._event_running:
+            logger.debug(f"MQTT disconnected (rc={rc}), will auto-reconnect")
+
+    # --- SSE fallback ---
+
+    def _sse_loop(self):
+        """Listen to Arlo's SSE event stream (fallback when MQTT unavailable)."""
         url = f"{ARLO_URLS['base']}/client/subscribe"
         headers = dict(self.session.headers)
         headers["Accept"] = "text/event-stream"
@@ -531,8 +639,10 @@ class ArloCloudAPI:
                     logger.debug(f"SSE error: {e}, reconnecting...")
                     time.sleep(3)
 
+    # --- Shared event handling ---
+
     def _handle_event(self, event: dict):
-        """Process an SSE event."""
+        """Process an event from MQTT or SSE."""
         trans_id = event.get("transId", "")
 
         if trans_id and trans_id in self._pending:
@@ -551,11 +661,15 @@ class ArloCloudAPI:
 
     def stop_event_stream(self):
         self._event_running = False
+        if self._mqtt_client:
+            self._mqtt_client.loop_stop()
+            self._mqtt_client.disconnect()
+            self._mqtt_client = None
         if self._event_thread:
             self._event_thread.join(timeout=5)
 
     def on_event(self, callback: Callable):
-        """Register a callback for SSE events."""
+        """Register a callback for events."""
         self._event_callbacks.append(callback)
 
     # === Command Sending ===
@@ -641,7 +755,7 @@ class ArloCloudAPI:
         duration: float = 0.5,
     ) -> bool:
         """
-        Move camera using ONVIF-style continuous move.
+        Move camera using ONVIF relativeMove — matches the Arlo app's format.
         pan: -1.0 (left) to 1.0 (right)
         tilt: -1.0 (down) to 1.0 (up)
         """
@@ -649,25 +763,29 @@ class ArloCloudAPI:
         if cam and not cam.has_ptz:
             logger.warning(f"Camera {camera_id} may not support PTZ (model: {cam.model})")
 
-        x = max(-1.0, min(1.0, pan))
-        y = max(-1.0, min(1.0, tilt))
+        # Build translation properties — only include non-zero axes
+        translation: dict = {}
+        if pan != 0.0:
+            translation["x"] = max(-1.0, min(1.0, pan))
+        if tilt != 0.0:
+            translation["y"] = max(-1.0, min(1.0, tilt))
+
+        if not translation:
+            return False
 
         result = self.notify(
             device_id=camera_id,
-            action="set",
-            resource="cameras/ptz",
+            action="relativeMove",
+            resource=f"cameras/{camera_id}/ptz",
             properties={
-                "action": "continuousMove",
-                "velocity": {
-                    "panTiltSpaces": {
-                        "velocityGenericSpace": {"x": x, "y": y}
-                    },
+                "panTiltSpaces": {
+                    "translationGenericSpace": translation,
                 },
             },
         )
 
         if result is not None:
-            logger.info(f"Move: x={x:.2f} y={y:.2f}")
+            logger.info(f"Move: {translation}")
         return result is not None
 
     def move_to(
@@ -684,14 +802,11 @@ class ArloCloudAPI:
 
         result = self.notify(
             device_id=camera_id,
-            action="set",
-            resource="cameras/ptz",
+            action="absoluteMove",
+            resource=f"cameras/{camera_id}/ptz",
             properties={
-                "action": "absoluteMove",
-                "position": {
-                    "panTiltSpaces": {
-                        "positionGenericSpace": {"x": x, "y": y}
-                    },
+                "panTiltSpaces": {
+                    "positionGenericSpace": {"x": x, "y": y},
                 },
             },
         )
@@ -700,24 +815,16 @@ class ArloCloudAPI:
     def stop_move(self, camera_id: str) -> bool:
         """Stop any ongoing PTZ movement."""
         result = self.notify(
-            camera_id, "set", "cameras/ptz",
-            {"action": "stopMove"},
+            camera_id, "stopMove", f"cameras/{camera_id}/ptz",
+            {},
         )
         return result is not None
 
     def go_home(self, camera_id: str) -> bool:
-        """Return camera to home/center position."""
-        # Use absoluteMove to center position
+        """Return camera to home position."""
         result = self.notify(
-            camera_id, "set", "cameras/ptz",
-            {
-                "action": "absoluteMove",
-                "position": {
-                    "panTiltSpaces": {
-                        "positionGenericSpace": {"x": 0.0, "y": 0.0}
-                    },
-                },
-            },
+            camera_id, "gotoHomePosition", f"cameras/{camera_id}/ptz",
+            {},
         )
         return result is not None
 
@@ -783,7 +890,9 @@ class ArloCloudAPI:
         return None
 
     def start_stream(self, camera_id: str) -> Optional[str]:
-        """Start live stream. Returns stream URL if available."""
+        """Start live stream. Returns stream URL if available.
+        Also stores SIP call info for potential SIP-based PTZ control.
+        """
         camera = self.cameras.get(camera_id)
         parent_id = camera.parent_id if camera else camera_id
         xcloud_id = camera.xcloud_id if camera else ""
@@ -814,14 +923,28 @@ class ArloCloudAPI:
 
         if resp and resp.get("data"):
             data = resp["data"]
+
+            # Store the full stream data including SIP info
+            self._last_stream_data = data
+            sip_info = data.get("sipCallInfo", {})
+            if sip_info:
+                logger.info(f"SIP call info: {json.dumps(sip_info)}")
+            # Log any ICE/TURN/STUN servers
+            for key in ("iceServers", "turnServers", "stunServers", "mediaRelayInfo"):
+                if key in data:
+                    logger.info(f"Stream {key}: {json.dumps(data[key])}")
+
             url = data.get("url", "")
             if url:
-                # Use TLS variant
                 url = url.replace("rtsp://", "rtsps://")
                 logger.info(f"Stream URL: {url}")
                 return url
 
         return None
+
+    def get_last_stream_data(self) -> dict:
+        """Return the full data from the most recent startStream call."""
+        return getattr(self, "_last_stream_data", {})
 
     def stop_stream(self, camera_id: str) -> bool:
         result = self.notify(

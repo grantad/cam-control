@@ -21,6 +21,7 @@ Discovery requires root/sudo. Cloud mode does NOT require sudo.
 import os
 import sys
 import signal
+import subprocess
 import time
 import argparse
 import logging
@@ -312,27 +313,62 @@ def _control_local(args, config):
 
 def _run_interactive_cloud(api: ArloCloudAPI, camera_id: str, ccfg: dict,
                            config: Optional[dict] = None, config_path: str = "config.yaml"):
-    """Interactive control loop using cloud API."""
-    speed = ccfg["move_speed"]
-    step = 0.5   # ONVIF velocity: -1.0 to 1.0
-    duration = ccfg["move_duration"]
+    """Interactive control loop using cloud API with relativeMove PTZ."""
+    step = 0.05  # relativeMove step size (matching Arlo app's 0.05 increments)
     stream_active = False
+    ffmpeg_proc = None  # Background ffmpeg process consuming the stream
 
     def _ensure_stream():
-        """Start stream if not already active — required for PTZ motor control."""
-        nonlocal stream_active, camera_id
-        if stream_active:
+        """Start stream and consume with ffplay."""
+        nonlocal stream_active, camera_id, ffmpeg_proc
+        # Stream already running and ffplay alive? Nothing to do.
+        if stream_active and ffmpeg_proc and ffmpeg_proc.poll() is None:
             return True
+        # Kill old ffplay if it died
+        if ffmpeg_proc and ffmpeg_proc.poll() is not None:
+            ffmpeg_proc = None
+            stream_active = False
+
+        if stream_active:
+            return True  # Stream active but no ffplay (that's OK)
+
         print("  Starting stream (required for PTZ)...")
         url = api.start_stream(camera_id)
+
         if url:
-            print(f"  Stream active: {url[:60]}...")
-            stream_active = True
+            print(f"  Opening live view...")
+            try:
+                ffmpeg_proc = subprocess.Popen(
+                    ["ffplay", "-rtsp_transport", "tcp", "-i", url,
+                     "-window_title", "CamControl — Live View",
+                     "-loglevel", "quiet", "-nostats",
+                     "-fast", "-framedrop"],
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+                print(f"  Live view window opened.")
+            except FileNotFoundError:
+                print("  Warning: ffplay not found — no live view.")
+                print("  Install: brew install ffmpeg")
         else:
             print("  Stream start returned no URL (may still work).")
-            stream_active = True  # Try PTZ anyway
-        time.sleep(2)  # Give camera time to wake up
-        return stream_active
+
+        stream_active = True
+        time.sleep(5)  # Give camera time to fully wake up
+        return True
+
+    def _stop_stream():
+        """Stop ffplay."""
+        nonlocal ffmpeg_proc, stream_active
+        if ffmpeg_proc:
+            ffmpeg_proc.terminate()
+            try:
+                ffmpeg_proc.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                ffmpeg_proc.kill()
+            ffmpeg_proc = None
+        stream_active = False
 
     print("  === Controls ===")
     print("  Movement:    w/a/s/d or up/down/left/right")
@@ -370,50 +406,49 @@ def _run_interactive_cloud(api: ArloCloudAPI, camera_id: str, ccfg: dict,
         # Movement (auto-starts stream on first use)
         elif cmd_lower in ("w", "up"):
             _ensure_stream()
-            api.move(camera_id, tilt=step, speed=speed, duration=duration)
+            api.move(camera_id, tilt=step)
         elif cmd_lower in ("s", "down"):
             _ensure_stream()
-            api.move(camera_id, tilt=-step, speed=speed, duration=duration)
+            api.move(camera_id, tilt=-step)
         elif cmd_lower in ("a", "left"):
             _ensure_stream()
-            api.move(camera_id, pan=-step, speed=speed, duration=duration)
+            api.move(camera_id, pan=-step)
         elif cmd_lower in ("d", "right"):
             _ensure_stream()
-            api.move(camera_id, pan=step, speed=speed, duration=duration)
+            api.move(camera_id, pan=step)
         elif cmd_lower in ("+", "z", "zi", "zoomin"):
             _ensure_stream()
-            api.move(camera_id, zoom=step, speed=speed, duration=duration)
+            api.move(camera_id, zoom=step)
         elif cmd_lower in ("-", "x", "zo", "zoomout"):
             _ensure_stream()
-            api.move(camera_id, zoom=-step, speed=speed, duration=duration)
+            api.move(camera_id, zoom=-step)
 
         # Diagonals
         elif cmd_lower in ("wa", "upleft"):
             _ensure_stream()
-            api.move(camera_id, pan=-step, tilt=step, speed=speed, duration=duration)
+            api.move(camera_id, pan=-step, tilt=step)
         elif cmd_lower in ("wd", "upright"):
             _ensure_stream()
-            api.move(camera_id, pan=step, tilt=step, speed=speed, duration=duration)
+            api.move(camera_id, pan=step, tilt=step)
         elif cmd_lower in ("sa", "downleft"):
             _ensure_stream()
-            api.move(camera_id, pan=-step, tilt=-step, speed=speed, duration=duration)
+            api.move(camera_id, pan=-step, tilt=-step)
         elif cmd_lower in ("sd", "downright"):
             _ensure_stream()
-            api.move(camera_id, pan=step, tilt=-step, speed=speed, duration=duration)
+            api.move(camera_id, pan=step, tilt=-step)
 
         # Stop / Home
         elif cmd_lower in ("0", "stop"):
             api.stop_move(camera_id)
             print("  Stopped.")
         elif cmd_lower in ("h", "home"):
-            _ensure_stream()
             api.go_home(camera_id)
             print("  Returning home.")
 
-        # Speed
+        # Speed (adjusts step size for relativeMove)
         elif cmd_lower in [str(i) for i in range(1, 10)]:
-            speed = int(cmd_lower) / 10.0
-            print(f"  Speed: {speed}")
+            step = int(cmd_lower) * 0.01  # 0.01 to 0.09
+            print(f"  Step size: {step}")
 
         # Presets (goto)
         elif cmd_lower.startswith("p") and len(cmd_lower) == 2 and cmd_lower[1].isdigit():
@@ -433,12 +468,12 @@ def _run_interactive_cloud(api: ArloCloudAPI, camera_id: str, ccfg: dict,
             _ensure_stream()
             print("  Sweeping...")
             for _ in range(6):
-                api.move(camera_id, pan=0.5, speed=speed, duration=0.3)
+                api.move(camera_id, pan=0.05)
                 time.sleep(0.8)
             api.stop_move(camera_id)
             time.sleep(0.5)
             for _ in range(6):
-                api.move(camera_id, pan=-0.5, speed=speed, duration=0.3)
+                api.move(camera_id, pan=-0.05)
                 time.sleep(0.8)
             api.stop_move(camera_id)
             print("  Done.")
@@ -454,12 +489,12 @@ def _run_interactive_cloud(api: ArloCloudAPI, camera_id: str, ccfg: dict,
                 pan = float(parts[1])
                 tilt = float(parts[2])
                 zoom = float(parts[3]) if len(parts) > 3 else 0.0
-                api.move_to(camera_id, pan, tilt, zoom, speed)
+                api.move_to(camera_id, pan, tilt, zoom)
                 print(f"  Moving to pan={pan} tilt={tilt} zoom={zoom}")
             except (IndexError, ValueError):
                 print("  Usage: goto <pan> <tilt> [zoom]")
 
-        # Camera functions
+        # Camera functions (non-PTZ — always via REST)
         elif cmd_lower == "snap":
             url = api.trigger_snapshot(camera_id)
             print(f"  Snapshot: {url or 'triggered (no URL returned)'}")
@@ -479,42 +514,25 @@ def _run_interactive_cloud(api: ArloCloudAPI, camera_id: str, ccfg: dict,
             api.toggle_privacy(camera_id, False)
             print("  Privacy mode OFF (camera active)")
 
-        # Probe PTZ formats
+        # Probe PTZ
         elif cmd_lower == "test":
-            print("  Testing PTZ command formats (ONVIF-style)...")
+            _ensure_stream()
+            print("  Testing PTZ (relativeMove)...")
             tests = [
-                # ONVIF continuous move formats
-                ("cameras/ptz", {"action": "continuousMove", "velocity": {"panTiltSpaces": {"velocityGenericSpace": {"x": 0.5, "y": 0.0}}}}),
-                ("cameras/ptz", {"continuousMove": {"velocity": {"panTiltSpaces": {"velocityGenericSpace": {"x": 0.5, "y": 0.0}}}}}),
-                # ONVIF relative move
-                ("cameras/ptz", {"action": "relativeMove", "translation": {"panTiltSpaces": {"translationGenericSpace": {"x": 0.1, "y": 0.0}}}}),
-                # ONVIF absolute move
-                ("cameras/ptz", {"action": "absoluteMove", "position": {"panTiltSpaces": {"positionGenericSpace": {"x": 0.1, "y": 0.0}}}}),
-                # Position set (matching the event format exactly)
-                ("cameras/ptz", {"position": {"panTiltSpaces": {"positionGenericSpace": {"x": 0.5, "y": 0.0}}}}),
-                # Simple ONVIF-like with velocity
-                ("cameras/ptz", {"velocity": {"x": 0.5, "y": 0.0}}),
-                # Try with panTilt directly
-                ("cameras/ptz", {"panTilt": {"x": 0.1, "y": 0.0}}),
-                # Integer values in ONVIF format
-                ("cameras/ptz", {"action": "continuousMove", "velocity": {"panTiltSpaces": {"velocityGenericSpace": {"x": 1, "y": 0}}}}),
-                # Simple x/y move
-                ("cameras/ptz", {"action": "move", "x": 1, "y": 0}),
-                # Direction string
-                ("cameras/ptz", {"action": "right"}),
+                ("PAN RIGHT",  0.05, 0.0),
+                ("PAN LEFT",   -0.05, 0.0),
+                ("TILT UP",    0.0, 0.05),
+                ("TILT DOWN",  0.0, -0.05),
             ]
-            for resource, props in tests:
-                result = api.send_raw(camera_id, "set", resource, props)
-                err = ""
-                if result and isinstance(result, dict) and result.get("error"):
-                    err = f" ERR: {result['error'].get('message', result['error'])}"
-                elif result and isinstance(result, dict) and not result.get("error"):
-                    err = " OK!"
-                print(f"  {resource} | {json.dumps(props)}{err}")
-                time.sleep(1)
-            print("  Done. Check SSE output for responses. Wait ~30s for all events.")
+            for label, x, y in tests:
+                api.move(camera_id, pan=x, tilt=y)
+                print(f"  {label}: sent")
+                time.sleep(2)
+            api.go_home(camera_id)
+            print("  HOME: sent")
+            print("  Done. Watch the live view for movement!")
 
-        # Raw command
+        # Raw command (still via REST for flexibility)
         elif cmd_lower.startswith("raw "):
             parts = cmd.split(maxsplit=3)
             if len(parts) < 4:
@@ -527,13 +545,12 @@ def _run_interactive_cloud(api: ArloCloudAPI, camera_id: str, ccfg: dict,
             except json.JSONDecodeError:
                 print("  Error: Invalid JSON properties")
 
-        # Info
         # Switch camera
         elif cmd_lower in ("switch", "sw"):
             new_id = select_camera(api, camera_id, force_pick=True)
             if new_id != camera_id:
+                _stop_stream()  # Stop stream for old camera
                 camera_id = new_id
-                stream_active = False  # Need new stream for new camera
                 if config:
                     config["arlo"]["camera_serial"] = camera_id
                     save_config(config, config_path)
@@ -553,13 +570,14 @@ def _run_interactive_cloud(api: ArloCloudAPI, camera_id: str, ccfg: dict,
                 print(f"  PTZ:   {cam.has_ptz}")
                 print(f"  State: {cam.state}")
                 print(f"  ID:    {cam.device_id}")
-            print(f"  Speed: {speed}")
+            print(f"  Step:  {step}")
 
         else:
             print(f"  Unknown: {cmd}")
             print("  w/a/s/d=move, +/-=zoom, h=home, switch=change camera, q=quit")
 
     print("\n  Disconnecting...")
+    _stop_stream()
     api.close()
     print("  Done.\n")
 
@@ -802,12 +820,20 @@ def main():
 
     args = parser.parse_args()
 
-    level = logging.DEBUG if args.verbose else logging.INFO
+    # Reset terminal to sane state (prevents ^M from prior runs)
+    os.system("stty sane 2>/dev/null")
+
+    level = logging.DEBUG if args.verbose else logging.WARNING
     logging.basicConfig(
         level=level,
         format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
         datefmt="%H:%M:%S",
     )
+    # Quiet noisy libraries
+    logging.getLogger("urllib3").setLevel(logging.WARNING)
+    logging.getLogger("paho").setLevel(logging.WARNING)
+    if args.verbose:
+        logging.getLogger("arlo_cloud").setLevel(logging.INFO)
 
     config = load_config(args.config)
     if args.interface:
