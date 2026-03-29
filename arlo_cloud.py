@@ -5,28 +5,31 @@ Authenticates with Arlo's cloud, establishes an event stream (SSE/MQTT),
 and sends PTZ + control commands through their infrastructure.
 
 Bypasses the Arlo app — you control the camera from the CLI.
+
+Auth flow reverse-engineered from pyaarlo (twrecked/pyaarlo).
 """
 
+import base64
 import json
 import time
 import logging
 import threading
 import uuid
-import re
 import ssl
 from typing import Optional, Any, Callable
 from dataclasses import dataclass, field
 
+import cloudscraper
 import requests
 
 logger = logging.getLogger(__name__)
 
+# Correct Arlo API endpoints (from pyaarlo reverse engineering)
 ARLO_URLS = {
     "base":       "https://myapi.arlo.com/hmsweb",
-    "auth":       "https://oculus-tfe.arlo.com/api",
-    "mqtt_host":  "mqtt-cluster-z1.arloxcld.com",
-    "mqtt_port":  8883,
-    "mqtt_wss":   "wss://mqtt-cluster-z1.arloxcld.com:8084/mqtt",
+    "auth":       "https://ocapi-app.arlo.com/api",
+    "mqtt_host":  "mqtt-cluster.arloxcld.com",
+    "mqtt_port":  443,
 }
 
 # Known PTZ-capable Arlo models (direct WiFi)
@@ -71,19 +74,44 @@ class ArloCloudAPI:
     """
 
     def __init__(self):
+        # Use cloudscraper for auth endpoint (Cloudflare-protected)
+        self._auth_session = cloudscraper.create_scraper()
+
+        # Regular session for API calls
         self.session = requests.Session()
-        self.session.headers.update({
+
+        # Device ID for this "client" — persisted across requests
+        self._device_id = str(uuid.uuid4())
+
+        # Auth headers (matching the Arlo iOS app)
+        self._auth_headers = {
+            "Accept": "application/json, text/plain, */*",
+            "Accept-Encoding": "gzip, deflate, br",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Cache-Control": "no-cache",
             "Content-Type": "application/json",
-            "User-Agent": (
-                "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) "
-                "AppleWebKit/605.1.15 (KHTML, like Gecko) "
-                "Mobile/15E148"
-            ),
+            "Origin": "https://my.arlo.com",
+            "Pragma": "no-cache",
+            "Referer": "https://my.arlo.com/",
+            "Source": "arloCamWeb",
+            "User-Agent": "(iPhone15,2 18_1_1) iOS Arlo 5.4.3",
+            "X-User-Device-Automation-Name": "Q2FtQ29udHJvbA==",  # base64("CamControl")
+            "X-User-Device-Id": self._device_id,
+            "X-User-Device-Type": "BROWSER",
+        }
+
+        # API headers
+        self._api_headers = {
+            "Accept": "application/json",
+            "Auth-Version": "2",
+            "Content-Type": "application/json; charset=utf-8;",
             "Origin": "https://my.arlo.com",
             "Referer": "https://my.arlo.com/",
             "SchemaVersion": "1",
-            "Accept": "application/json",
-        })
+            "User-Agent": "(iPhone15,2 18_1_1) iOS Arlo 5.4.3",
+        }
+
+        self.session.headers.update(self._api_headers)
 
         self.authenticated = False
         self.user_id = ""
@@ -105,19 +133,25 @@ class ArloCloudAPI:
         # Callbacks
         self._event_callbacks: list[Callable] = []
 
+        # 2FA state
+        self._factor_id = ""
+        self._auth_token_partial = ""
+
     # === Authentication ===
 
     def login(self, email: str, password: str) -> bool:
         """
         Login to Arlo cloud. Returns True if successful.
-        May require 2FA — check needs_2fa after calling.
+        If 2FA is required, returns False and sets up state for verify_2fa().
         """
         logger.info("Logging in to Arlo cloud...")
 
-        # Step 1: Get auth token
-        resp = self._post(f"{ARLO_URLS['auth']}/auth", {
+        # Arlo expects the password base64-encoded
+        password_b64 = base64.b64encode(password.encode()).decode()
+
+        resp = self._auth_post(f"{ARLO_URLS['auth']}/auth", {
             "email": email,
-            "password": password,
+            "password": password_b64,
             "language": "en",
             "EnvSource": "prod",
         })
@@ -126,32 +160,76 @@ class ArloCloudAPI:
             return False
 
         data = resp.get("data", {})
+        meta = resp.get("meta", {})
+        code = meta.get("code", 0)
 
-        if resp.get("meta", {}).get("code") == 200:
+        if code == 200 and data.get("token"):
             # Direct success (no 2FA)
             return self._complete_auth(data)
 
-        # Check for 2FA requirement
-        if data.get("factorAuthId") or resp.get("meta", {}).get("code") == 202:
-            self._factor_id = data.get("factorAuthId", "")
+        # 2FA required (code 200 with authenticated=false, or code 202)
+        if data.get("authenticated") is False or code == 202:
             self._auth_token_partial = data.get("token", "")
-            logger.info("2FA required. Call verify_2fa() with the code.")
-            return False
+            self._factor_id = data.get("factorAuthId", "")
 
-        logger.error(f"Login failed: {resp.get('meta', {}).get('message', 'unknown error')}")
+            # If no factorAuthId, we need to get factors and start auth
+            if not self._factor_id and self._auth_token_partial:
+                self._factor_id = self._start_2fa()
+
+            if self._factor_id:
+                logger.info("2FA required. Call verify_2fa() with the code.")
+                return False
+
+        logger.error(f"Login failed: {meta.get('message', 'unknown error')} (code={code})")
         return False
 
+    def _start_2fa(self) -> str:
+        """Get available 2FA factors and start verification."""
+        # Get factors
+        headers = {"Authorization": self._auth_token_partial}
+        resp = self._auth_get(
+            f"{ARLO_URLS['auth']}/getFactors?data={int(time.time() * 1000)}",
+            extra_headers=headers,
+        )
+
+        if not resp or not resp.get("data"):
+            logger.error("Failed to get 2FA factors")
+            return ""
+
+        factors = resp["data"].get("items", [])
+        if not factors:
+            logger.error("No 2FA factors available")
+            return ""
+
+        # Pick the first factor (usually email or SMS)
+        factor = factors[0]
+        factor_id = factor.get("factorId", "")
+        factor_type = factor.get("factorType", "")
+        logger.info(f"Using 2FA factor: {factor_type} ({factor_id})")
+
+        # Start auth for this factor
+        resp = self._auth_post(
+            f"{ARLO_URLS['auth']}/startAuth",
+            {"factorId": factor_id, "factorType": factor_type},
+            extra_headers=headers,
+        )
+
+        if resp and resp.get("data"):
+            return resp["data"].get("factorAuthId", "")
+
+        return factor_id
+
     def verify_2fa(self, code: str) -> bool:
-        """Complete 2FA verification."""
-        if not hasattr(self, '_factor_id'):
+        """Complete 2FA verification with the code sent to your device."""
+        if not self._factor_id:
             logger.error("No pending 2FA. Call login() first.")
             return False
 
-        # Submit 2FA code
         headers = {"Authorization": self._auth_token_partial}
-        resp = self._post(
-            f"{ARLO_URLS['auth']}/auth/validateAccessToken",
-            {"factorAuthId": self._factor_id, "otp": code},
+
+        resp = self._auth_post(
+            f"{ARLO_URLS['auth']}/finishAuth",
+            {"factorAuthCode": code, "factorAuthId": self._factor_id},
             extra_headers=headers,
         )
 
@@ -159,19 +237,29 @@ class ArloCloudAPI:
             return False
 
         data = resp.get("data", {})
+        meta = resp.get("meta", {})
 
-        if resp.get("meta", {}).get("code") == 200:
+        if meta.get("code") == 200 and data.get("token"):
             return self._complete_auth(data)
 
-        logger.error(f"2FA failed: {resp.get('meta', {}).get('message', 'invalid code')}")
+        # Try alternative endpoint
+        resp = self._auth_post(
+            f"{ARLO_URLS['auth']}/validateAccessToken",
+            {"factorAuthCode": code},
+            extra_headers=headers,
+        )
+
+        if resp and resp.get("data", {}).get("token"):
+            return self._complete_auth(resp["data"])
+
+        logger.error(f"2FA failed: {meta.get('message', 'invalid code')}")
         return False
 
     def login_with_token(self, token: str) -> bool:
-        """Login using a previously captured/saved auth token."""
+        """Login using a previously saved auth token."""
         self.token = token
         self.session.headers["Authorization"] = token
 
-        # Validate token by fetching profile
         resp = self._get(f"{ARLO_URLS['base']}/users/profile")
         if resp and resp.get("data"):
             data = resp["data"]
@@ -182,15 +270,20 @@ class ArloCloudAPI:
             return True
 
         logger.error("Token invalid or expired")
+        self.session.headers.pop("Authorization", None)
         return False
 
     def _complete_auth(self, data: dict) -> bool:
         """Complete authentication with token data."""
         self.token = data.get("token", "")
         self.user_id = data.get("userId", "")
+
+        if not self.token:
+            logger.error("No token in auth response")
+            return False
+
         self.authenticated = True
         self.web_id = f"{self.user_id}_web"
-
         self.session.headers["Authorization"] = self.token
 
         logger.info(f"Authenticated as {self.user_id}")
@@ -204,7 +297,11 @@ class ArloCloudAPI:
             logger.error("Not authenticated. Call login() first.")
             return False
 
-        resp = self._get(f"{ARLO_URLS['base']}/users/devices")
+        # Try v2 endpoint first, fall back to v1
+        resp = self._get(f"{ARLO_URLS['base']}/v2/users/devices")
+        if not resp or not resp.get("data"):
+            resp = self._get(f"{ARLO_URLS['base']}/users/devices")
+
         if not resp or not resp.get("data"):
             logger.error("Failed to get device list")
             return False
@@ -217,7 +314,7 @@ class ArloCloudAPI:
             device_id = dev.get("deviceId", "")
             model = dev.get("modelId", "").lower()
 
-            if device_type in ("camera", "arlocqs", "arloq", "arloqs"):
+            if device_type in ("camera", "arlocqs", "arloq", "arloqs", "doorbell"):
                 cam = ArloCloudCamera(
                     device_id=device_id,
                     parent_id=dev.get("parentId", ""),
@@ -262,7 +359,6 @@ class ArloCloudAPI:
             target=self._event_loop, daemon=True, name="arlo-sse"
         )
         self._event_thread.start()
-        # Give the stream time to connect
         time.sleep(2)
 
     def _event_loop(self):
@@ -288,7 +384,6 @@ class ArloCloudAPI:
                     if not line:
                         continue
 
-                    # SSE format: "data: {json}"
                     if line.startswith("data:"):
                         raw = line[5:].strip()
                     elif line.startswith("{"):
@@ -304,7 +399,7 @@ class ArloCloudAPI:
                     self._handle_event(event)
 
             except requests.exceptions.Timeout:
-                continue  # Normal SSE reconnect
+                continue
             except Exception as e:
                 if self._event_running:
                     logger.debug(f"SSE error: {e}, reconnecting...")
@@ -314,19 +409,16 @@ class ArloCloudAPI:
         """Process an SSE event."""
         trans_id = event.get("transId", "")
 
-        # Match to pending command
         if trans_id and trans_id in self._pending:
             self._responses[trans_id] = event
             self._pending[trans_id].set()
 
-        # Fire callbacks
         for cb in self._event_callbacks:
             try:
                 cb(event)
             except Exception as e:
                 logger.debug(f"Event callback error: {e}")
 
-        # Log PTZ events
         resource = event.get("resource", "")
         if "ptz" in resource.lower():
             logger.debug(f"PTZ event: {json.dumps(event)}")
@@ -363,7 +455,6 @@ class ArloCloudAPI:
         the base station local API but routed through cloud.
         """
         camera = self.cameras.get(device_id)
-        # For direct-WiFi cameras, the parent is usually the camera itself
         parent_id = camera.parent_id if camera else device_id
 
         trans_id = self._next_trans_id()
@@ -378,11 +469,9 @@ class ArloCloudAPI:
             "properties": properties,
         }
 
-        # For cameras behind a base station, wrap differently
         if camera and camera.parent_id and camera.parent_id != camera.device_id:
             payload["to"] = camera.parent_id
 
-        # Set up response waiter
         if publish_response:
             event = threading.Event()
             self._pending[trans_id] = event
@@ -545,7 +634,7 @@ class ArloCloudAPI:
             {
                 "to": parent_id,
                 "from": self.web_id,
-                "resource": "cameras/{camera_id}",
+                "resource": f"cameras/{camera_id}",
                 "action": "set",
                 "publishResponse": True,
                 "transId": self._next_trans_id(),
@@ -588,7 +677,39 @@ class ArloCloudAPI:
 
     # === HTTP Helpers ===
 
+    def _auth_get(self, url: str, extra_headers: Optional[dict] = None) -> Optional[dict]:
+        """GET request using the auth session (cloudscraper for Cloudflare)."""
+        try:
+            headers = dict(self._auth_headers)
+            if extra_headers:
+                headers.update(extra_headers)
+            resp = self._auth_session.get(url, headers=headers, timeout=15)
+            logger.debug(f"AUTH GET {url} -> {resp.status_code}")
+            if resp.headers.get("content-type", "").startswith("application/json"):
+                return resp.json()
+            return None
+        except Exception as e:
+            logger.error(f"AUTH GET {url} failed: {e}")
+            return None
+
+    def _auth_post(self, url: str, body: dict, extra_headers: Optional[dict] = None) -> Optional[dict]:
+        """POST request using the auth session (cloudscraper for Cloudflare)."""
+        try:
+            headers = dict(self._auth_headers)
+            if extra_headers:
+                headers.update(extra_headers)
+            resp = self._auth_session.post(url, json=body, headers=headers, timeout=15)
+            logger.debug(f"AUTH POST {url} -> {resp.status_code}")
+            if resp.headers.get("content-type", "").startswith("application/json"):
+                return resp.json()
+            logger.debug(f"AUTH response body: {resp.text[:500]}")
+            return {"status": resp.status_code, "text": resp.text[:500]}
+        except Exception as e:
+            logger.error(f"AUTH POST {url} failed: {e}")
+            return None
+
     def _get(self, url: str, extra_headers: Optional[dict] = None) -> Optional[dict]:
+        """GET request using the API session."""
         try:
             headers = dict(self.session.headers)
             if extra_headers:
@@ -597,15 +718,15 @@ class ArloCloudAPI:
             if resp.status_code == 200:
                 return resp.json()
             logger.debug(f"GET {url} -> {resp.status_code}")
-            return resp.json() if resp.headers.get("content-type", "").startswith("application/json") else None
+            if resp.headers.get("content-type", "").startswith("application/json"):
+                return resp.json()
+            return None
         except Exception as e:
             logger.error(f"GET {url} failed: {e}")
             return None
 
-    def _post(
-        self, url: str, body: dict,
-        extra_headers: Optional[dict] = None,
-    ) -> Optional[dict]:
+    def _post(self, url: str, body: dict, extra_headers: Optional[dict] = None) -> Optional[dict]:
+        """POST request using the API session."""
         try:
             headers = dict(self.session.headers)
             if extra_headers:
@@ -626,3 +747,4 @@ class ArloCloudAPI:
         except Exception:
             pass
         self.session.close()
+        self._auth_session.close()

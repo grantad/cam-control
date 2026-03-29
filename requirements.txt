@@ -3,3 +3,4 @@ pyyaml
 requests
 cryptography
 urllib3
+cloudscraper
