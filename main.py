@@ -445,6 +445,32 @@ def _run_interactive_cloud(api: ArloCloudAPI, camera_id: str, ccfg: dict,
             api.toggle_privacy(camera_id, False)
             print("  Privacy mode OFF (camera active)")
 
+        # Probe PTZ formats
+        elif cmd_lower == "test":
+            print("  Testing PTZ command formats...")
+            tests = [
+                ("cameras/ptz", {"action": "move", "pan": 1, "tilt": 0, "zoom": 0, "speed": 5, "duration": 1}),
+                ("cameras/ptz", {"action": "move", "pan": 10, "tilt": 0, "zoom": 0}),
+                ("cameras/ptz", {"direction": "right", "speed": 5}),
+                ("cameras/ptz", {"action": "right"}),
+                (f"cameras/{camera_id}", {"ptz": {"pan": 10, "tilt": 0}}),
+                (f"cameras/{camera_id}", {"action": "ptzMove", "direction": "right"}),
+                ("ptz", {"action": "move", "direction": "right"}),
+                ("cameras/ptz", {"action": "move", "x": 1, "y": 0}),
+                ("cameras/ptz", {"action": "right", "speed": 1}),
+                ("cameras/ptz", {"movePan": 10}),
+            ]
+            for resource, props in tests:
+                result = api.send_raw(camera_id, "set", resource, props)
+                err = ""
+                if result and isinstance(result, dict) and result.get("error"):
+                    err = f" ERR: {result['error'].get('message', result['error'])}"
+                elif result and isinstance(result, dict) and not result.get("error"):
+                    err = " OK!"
+                print(f"  {resource} | {json.dumps(props)}{err}")
+                time.sleep(1)
+            print("  Done. Check SSE output for responses. Wait ~30s for all events.")
+
         # Raw command
         elif cmd_lower.startswith("raw "):
             parts = cmd.split(maxsplit=3)
