@@ -195,20 +195,32 @@ class ArloCloudAPI:
 
     def _start_2fa(self) -> str:
         """Get available 2FA factors and start verification."""
+        # Use base64-encoded token for auth calls
+        token_b64 = base64.b64encode(self._auth_token_partial.encode()).decode()
+        headers = {"Authorization": token_b64}
+
         # Get factors
-        headers = {"Authorization": self._auth_token_partial}
+        ts = int(time.time())
         resp = self._auth_get(
-            f"{ARLO_URLS['auth']}/getFactors?data={int(time.time() * 1000)}",
+            f"{ARLO_URLS['auth']}/getFactors?data = {ts}",
             extra_headers=headers,
         )
+
+        logger.debug(f"getFactors response: {json.dumps(resp)[:500] if resp else 'None'}")
 
         if not resp or not resp.get("data"):
             logger.error("Failed to get 2FA factors")
             return ""
 
-        factors = resp["data"].get("items", [])
+        data = resp["data"]
+        # Factors can be in "items" or directly in data as a list
+        factors = data.get("items", [])
+        if not factors and isinstance(data, list):
+            factors = data
         if not factors:
-            logger.error("No 2FA factors available")
+            # Try treating data as a dict with factor info
+            logger.debug(f"2FA data keys: {list(data.keys()) if isinstance(data, dict) else 'not a dict'}")
+            logger.error("No 2FA factors found in response")
             return ""
 
         # Pick the first factor (usually email or SMS)
@@ -224,8 +236,12 @@ class ArloCloudAPI:
             extra_headers=headers,
         )
 
+        logger.debug(f"startAuth response: {json.dumps(resp)[:500] if resp else 'None'}")
+
         if resp and resp.get("data"):
-            return resp["data"].get("factorAuthId", "")
+            auth_id = resp["data"].get("factorAuthId", "")
+            if auth_id:
+                return auth_id
 
         return factor_id
 
