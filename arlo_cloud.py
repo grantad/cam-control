@@ -38,6 +38,7 @@ PTZ_MODELS = {
     "vmc4060p", "abc1000", "vmc2040", "vmc2040s",
     "vml4030", "vml2030", "vmc3060", "vmc3060s",
     "vmc2032", "vmc3052",
+    "vmc3073", "vmc3073a", "vmc3073b",  # Essential Pan-Tilt
 }
 
 
@@ -862,12 +863,13 @@ class ArloCloudAPI:
             logger.error(f"POST {url} failed: {e}")
             return None
 
-    def close(self):
-        """Logout and cleanup."""
+    def close(self, logout: bool = False):
+        """Cleanup sessions. Only logout if explicitly requested (invalidates token)."""
         self.stop_event_stream()
-        try:
-            self._get(f"{ARLO_URLS['base']}/logout")
-        except Exception:
-            pass
+        if logout:
+            try:
+                self._get(f"{ARLO_URLS['base']}/logout")
+            except Exception:
+                pass
         self.session.close()
         self._auth_session.close()
