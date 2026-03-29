@@ -136,6 +136,8 @@ class ArloCloudAPI:
 
         # 2FA state
         self._factor_id = ""
+        self._factor_type = ""          # PUSH, SMS, EMAIL
+        self._factor_auth_code = ""     # factorAuthCode from startAuth
         self._auth_token_partial = ""
 
     # === Authentication ===
@@ -223,41 +225,52 @@ class ArloCloudAPI:
             logger.error("No 2FA factors found in response")
             return ""
 
-        # Pick the first factor (usually email or SMS)
+        # Prefer PUSH, then EMAIL, then SMS
         factor = factors[0]
+        for f in factors:
+            if f.get("factorType") == "PUSH":
+                factor = f
+                break
+
         factor_id = factor.get("factorId", "")
-        factor_type = factor.get("factorType", "")
-        logger.info(f"Using 2FA factor: {factor_type} ({factor_id})")
+        self._factor_type = factor.get("factorType", "")
+        logger.info(f"Using 2FA factor: {self._factor_type} — {factor.get('factorNickname', factor_id[:20])}")
 
         # Start auth for this factor
         resp = self._auth_post(
             f"{ARLO_URLS['auth']}/startAuth",
-            {"factorId": factor_id, "factorType": factor_type},
+            {"factorId": factor_id, "factorType": self._factor_type},
             extra_headers=headers,
         )
 
         logger.debug(f"startAuth response: {json.dumps(resp)[:500] if resp else 'None'}")
 
         if resp and resp.get("data"):
-            auth_id = resp["data"].get("factorAuthId", "")
-            if auth_id:
-                return auth_id
+            self._factor_auth_code = resp["data"].get("factorAuthCode", "")
+            return factor_id
 
         return factor_id
 
-    def verify_2fa(self, code: str) -> bool:
-        """Complete 2FA verification with the code sent to your device."""
+    def verify_2fa(self, code: str = "") -> bool:
+        """
+        Complete 2FA verification.
+        For PUSH: call with empty code — polls until push is approved.
+        For SMS/EMAIL: call with the code you received.
+        """
         if not self._factor_id:
             logger.error("No pending 2FA. Call login() first.")
             return False
 
-        # Use base64-encoded partial token for auth header
         token_b64 = base64.b64encode(self._auth_token_partial.encode()).decode()
         headers = {"Authorization": token_b64}
 
+        if self._factor_type == "PUSH":
+            return self._verify_push(headers)
+
+        # SMS/EMAIL: submit the code
         resp = self._auth_post(
             f"{ARLO_URLS['auth']}/finishAuth",
-            {"factorAuthCode": code, "factorAuthId": self._factor_id},
+            {"factorAuthCode": code, "factorAuthId": self._factor_auth_code},
             extra_headers=headers,
         )
 
@@ -273,6 +286,48 @@ class ArloCloudAPI:
             return self._complete_auth(data)
 
         logger.error(f"2FA failed: {meta.get('message', 'invalid code')}")
+        return False
+
+    def _verify_push(self, headers: dict, timeout: int = 120, interval: int = 3) -> bool:
+        """Poll finishAuth until push notification is approved on phone."""
+        logger.info(f"Waiting for push approval (timeout={timeout}s)...")
+
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            resp = self._auth_post(
+                f"{ARLO_URLS['auth']}/finishAuth",
+                {"factorAuthCode": self._factor_auth_code},
+                extra_headers=headers,
+            )
+
+            if not resp:
+                time.sleep(interval)
+                continue
+
+            data = resp.get("data", {})
+            meta = resp.get("meta", {})
+            code = meta.get("code", 0)
+
+            logger.debug(f"Push poll: code={code} keys={list(data.keys()) if isinstance(data, dict) else 'not dict'}")
+
+            if code == 200 and isinstance(data, dict) and data.get("token"):
+                logger.info("Push approved!")
+                return self._complete_auth(data)
+
+            # 202 = still waiting for approval
+            if code == 202:
+                time.sleep(interval)
+                continue
+
+            # Any other code = failure
+            if code not in (200, 202):
+                logger.debug(f"Push poll got code {code}: {meta.get('message', '')}")
+                time.sleep(interval)
+                continue
+
+            time.sleep(interval)
+
+        logger.error("Push approval timed out")
         return False
 
     def login_with_token(self, token: str) -> bool:

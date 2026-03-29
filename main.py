@@ -101,12 +101,19 @@ def cloud_login(config: dict, config_path: str) -> ArloCloudAPI:
     else:
         # Check for 2FA
         if hasattr(api, '_factor_id') and api._factor_id:
-            print("  2FA required. Check your email/phone for the code.")
-            code = input("  2FA code: ").strip()
-            if not api.verify_2fa(code):
-                print("  2FA verification failed.")
-                sys.exit(1)
-            print("  2FA verified!")
+            if api._factor_type == "PUSH":
+                print("  Push notification sent to your phone. Approve it...")
+                if not api.verify_2fa():
+                    print("  Push approval failed or timed out.")
+                    sys.exit(1)
+                print("  Push approved!")
+            else:
+                print(f"  2FA required ({api._factor_type}). Check your email/phone.")
+                code = input("  2FA code: ").strip()
+                if not api.verify_2fa(code):
+                    print("  2FA verification failed.")
+                    sys.exit(1)
+                print("  2FA verified!")
         else:
             print("  Login failed. Check credentials.")
             sys.exit(1)
