@@ -33,8 +33,8 @@ services:
       # API and auth
       - WB_API=true
       - WB_AUTH=false
-      # TUTK P2P: use relay mode to avoid NAT/Docker networking issues
-      - NET_MODE=LAN
+      # TUTK P2P: use ANY mode (cloud relay) since Docker can't reach LAN directly
+      - NET_MODE=ANY
       - ENABLE_AUDIO=true
       # On-demand streaming: only connect when someone requests
       - ON_DEMAND=true
