@@ -1,0 +1,22 @@
+network:
+  interface: null
+  subnet: null
+
+arlo:
+  base_station_ip: null
+  camera_serial: null
+  email: you@example.com
+  mode: cloud
+
+wyze:
+  email: you@example.com
+  camera_mac: null
+  bridge_url: http://localhost:5151
+
+intercept:
+  capture_dir: ./captures
+
+control:
+  move_speed: 0.5
+  move_duration: 0.5
+  step_interval: 0.1

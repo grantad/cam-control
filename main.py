@@ -32,6 +32,11 @@ import json
 import getpass
 from typing import Optional
 
+try:
+    import keyring
+except ImportError:
+    keyring = None
+
 import yaml
 
 from discovery import discover_arlo_devices, print_devices, get_subnet
@@ -39,6 +44,66 @@ from arlo_cloud import ArloCloudAPI
 from wyze_cloud import WyzeCloudAPI
 
 logger = logging.getLogger("camcontrol")
+KEYRING_SERVICE = "cam-control"
+SECRET_CONFIG_KEYS = {
+    "arlo": {"auth_token"},
+    "wyze": {"password", "key_id", "api_key"},
+    "blink": {"password"},
+    "ring": {"password"},
+}
+
+
+def _secret_env_name(section: str, key: str) -> str:
+    return f"CAMCONTROL_{section}_{key}".upper()
+
+
+def get_secret(config: dict, section: str, key: str) -> Optional[str]:
+    """Resolve a secret from env, keyring, or legacy config."""
+    env_value = os.getenv(_secret_env_name(section, key))
+    if env_value:
+        return env_value
+
+    if keyring:
+        try:
+            stored = keyring.get_password(KEYRING_SERVICE, f"{section}.{key}")
+            if stored:
+                return stored
+        except Exception as e:
+            logger.debug(f"Keyring lookup failed for {section}.{key}: {e}")
+
+    value = config.get(section, {}).get(key)
+    return value or None
+
+
+def set_secret(section: str, key: str, value: Optional[str]) -> bool:
+    """Persist a secret to the OS keychain when available."""
+    if not value:
+        return False
+    if not keyring:
+        logger.warning(
+            "keyring is not installed; secret was used for this run but not persisted. "
+            "Install dependencies or set %s.",
+            _secret_env_name(section, key),
+        )
+        return False
+    try:
+        keyring.set_password(KEYRING_SERVICE, f"{section}.{key}", value)
+        return True
+    except Exception as e:
+        logger.warning(f"Could not save {section}.{key} to keyring: {e}")
+        return False
+
+
+def scrub_secrets(config: dict) -> dict:
+    """Remove secrets before writing config to disk."""
+    clean = json.loads(json.dumps(config))
+    for section, keys in SECRET_CONFIG_KEYS.items():
+        section_cfg = clean.get(section)
+        if not isinstance(section_cfg, dict):
+            continue
+        for key in keys:
+            section_cfg.pop(key, None)
+    return clean
 
 
 def load_config(path: str = "config.yaml") -> dict:
@@ -46,16 +111,12 @@ def load_config(path: str = "config.yaml") -> dict:
         "network": {"interface": None, "subnet": None},
         "arlo": {
             "base_station_ip": None,
-            "auth_token": None,
             "camera_serial": None,
             "email": None,
             "mode": "cloud",  # "cloud" or "local"
         },
         "wyze": {
             "email": None,
-            "password": None,
-            "key_id": None,
-            "api_key": None,
             "camera_mac": None,
             "bridge_url": "http://localhost:5151",
         },
@@ -87,7 +148,7 @@ def load_config(path: str = "config.yaml") -> dict:
 
 def save_config(config: dict, path: str = "config.yaml"):
     with open(path, "w") as f:
-        yaml.dump(config, f, default_flow_style=False)
+        yaml.dump(scrub_secrets(config), f, default_flow_style=False, sort_keys=False)
 
 
 # === Cloud API helpers ===
@@ -97,7 +158,7 @@ def cloud_login(config: dict, config_path: str) -> ArloCloudAPI:
     api = ArloCloudAPI()
 
     # Try saved token first
-    token = config["arlo"].get("auth_token")
+    token = get_secret(config, "arlo", "auth_token")
     if token:
         print("  Trying saved auth token...")
         if api.login_with_token(token):
@@ -132,10 +193,12 @@ def cloud_login(config: dict, config_path: str) -> ArloCloudAPI:
             sys.exit(1)
 
     # Save token and email for next time
-    config["arlo"]["auth_token"] = api.token
     config["arlo"]["email"] = email
     save_config(config, config_path)
-    print(f"  Token saved to {config_path}")
+    if set_secret("arlo", "auth_token", api.token):
+        print("  Token saved to keychain.")
+    else:
+        print("  Token not persisted; set CAMCONTROL_ARLO_AUTH_TOKEN to reuse it.")
 
     return api
 
@@ -234,7 +297,7 @@ def cmd_control(args, config):
     brand = getattr(args, 'brand', None)
 
     if not brand:
-        has_arlo = bool(config["arlo"].get("auth_token") or config["arlo"].get("email"))
+        has_arlo = bool(get_secret(config, "arlo", "auth_token") or config["arlo"].get("email"))
         has_wyze = bool(config["wyze"].get("email"))
         if has_arlo and has_wyze:
             choice = input("  Brand [arlo/wyze]: ").strip().lower()
@@ -307,11 +370,11 @@ def _control_wyze(args, config):
 
     # Try auth: wyze-sdk first, then bridge-only
     email = config["wyze"].get("email")
-    password = config["wyze"].get("password")
+    password = get_secret(config, "wyze", "password")
 
     if email and password:
-        key_id = config["wyze"].get("key_id") or ""
-        api_key = config["wyze"].get("api_key") or ""
+        key_id = get_secret(config, "wyze", "key_id") or ""
+        api_key = get_secret(config, "wyze", "api_key") or ""
         if not api.login(email, password, key_id, api_key):
             print("  Wyze login failed. Trying bridge-only mode...")
             if not api.login_with_bridge():
@@ -387,8 +450,8 @@ def cmd_wyze_login(args, config):
     email = config["wyze"].get("email") or input("  Wyze email: ").strip()
     password = getpass.getpass("  Wyze password: ")
 
-    key_id = config["wyze"].get("key_id")
-    api_key = config["wyze"].get("api_key")
+    key_id = get_secret(config, "wyze", "key_id")
+    api_key = get_secret(config, "wyze", "api_key")
     if not key_id or not api_key:
         print("\n  Wyze requires an API key (free, takes 30 seconds):")
         print("    1. Go to https://developer-api-console.wyze.com/")
@@ -412,11 +475,18 @@ def cmd_wyze_login(args, config):
 
     # Save credentials
     config["wyze"]["email"] = email
-    config["wyze"]["password"] = password  # TODO: use keyring for production
-    if key_id:
-        config["wyze"]["key_id"] = key_id
-        config["wyze"]["api_key"] = api_key
     save_config(config, args.config)
+    saved = []
+    if set_secret("wyze", "password", password):
+        saved.append("password")
+    if key_id and set_secret("wyze", "key_id", key_id):
+        saved.append("key_id")
+    if api_key and set_secret("wyze", "api_key", api_key):
+        saved.append("api_key")
+    if saved:
+        print(f"  Saved to keychain: {', '.join(saved)}")
+    else:
+        print("  Secrets not persisted; set CAMCONTROL_WYZE_PASSWORD / KEY_ID / API_KEY to reuse them.")
 
     print("\n  Fetching devices...")
     api.get_devices()
@@ -454,12 +524,16 @@ def cmd_wyze_bridge(args, config):
 
         # Write .env file next to the compose file so docker-compose picks it up
         wyze_cfg = config.get("wyze", {})
+        wyze_password = get_secret(config, "wyze", "password") or ""
+        wyze_key_id = get_secret(config, "wyze", "key_id") or ""
+        wyze_api_key = get_secret(config, "wyze", "api_key") or ""
         env_file = os.path.join(os.path.dirname(compose_file) or ".", ".env")
         with open(env_file, "w") as f:
             f.write(f"WYZE_EMAIL={wyze_cfg.get('email', '')}\n")
-            f.write(f"WYZE_PASSWORD={wyze_cfg.get('password', '')}\n")
-            f.write(f"WYZE_KEY_ID={wyze_cfg.get('key_id', '')}\n")
-            f.write(f"WYZE_API_KEY={wyze_cfg.get('api_key', '')}\n")
+            f.write(f"WYZE_PASSWORD={wyze_password}\n")
+            f.write(f"WYZE_KEY_ID={wyze_key_id}\n")
+            f.write(f"WYZE_API_KEY={wyze_api_key}\n")
+        os.chmod(env_file, 0o600)
 
         # Force recreate so the container picks up new env vars
         result = subprocess.run(
@@ -496,7 +570,7 @@ def _control_local(args, config):
         print("  Run 'discover' first or use --base-ip")
         sys.exit(1)
 
-    auth_token = getattr(args, 'token', None) or config["arlo"]["auth_token"]
+    auth_token = getattr(args, 'token', None) or get_secret(config, "arlo", "auth_token")
 
     api = ArloLocalAPI(base_station_ip=base_ip, auth_token=auth_token)
     if not api.connect():
@@ -1239,9 +1313,10 @@ def cmd_intercept(args, config):
             print(f"  Saved {len(sniffer.commands)} commands to {path}")
         token = sniffer.get_latest_token()
         if token:
-            config["arlo"]["auth_token"] = token
-            save_config(config, args.config)
-            print(f"  Token saved.")
+            if set_secret("arlo", "auth_token", token):
+                print("  Token saved to keychain.")
+            else:
+                print("  Token not persisted; set CAMCONTROL_ARLO_AUTH_TOKEN to reuse it.")
         print(f"  Stats: {sniffer.stats}\n")
         sys.exit(0)
 
